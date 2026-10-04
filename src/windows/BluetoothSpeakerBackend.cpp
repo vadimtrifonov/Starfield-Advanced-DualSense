@@ -1,5 +1,7 @@
 #include <StarfieldDualSense/BluetoothSpeakerBackend.h>
 
+#include "OverlappedIo.h"
+
 #include <StarfieldDualSense/SpeakerMixer.h>
 
 #ifndef NOMINMAX
@@ -684,9 +686,7 @@ struct sds::BluetoothSpeakerBackend::Impl
                         FALSE);
 
             } else {
-                CancelIoEx(
-                    handle,
-                    &overlapped);
+                cancelIoAndWait(handle, overlapped);
 
                 ok =
                     FALSE;

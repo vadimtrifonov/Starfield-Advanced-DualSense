@@ -1,5 +1,7 @@
 #include <StarfieldDualSense/NativeBluetoothBackend.h>
 
+#include "OverlappedIo.h"
+
 #include <StarfieldDualSense/BluetoothDualSenseReports.h>
 #include <StarfieldDualSense/DeviceClassifier.h>
 #include <StarfieldDualSense/Touchpad.h>
@@ -234,7 +236,7 @@ struct sds::NativeBluetoothBackend::Impl
     {
         if (handle != INVALID_HANDLE_VALUE) {
             if (readPending) {
-                CancelIoEx(handle, &readOverlapped);
+                cancelIoAndWait(handle, readOverlapped);
             }
             CloseHandle(handle);
             handle = INVALID_HANDLE_VALUE;
@@ -323,7 +325,7 @@ struct sds::NativeBluetoothBackend::Impl
                     &bytesWritten,
                     FALSE);
             } else {
-                CancelIoEx(handle, &writeOverlapped);
+                cancelIoAndWait(handle, writeOverlapped);
                 ok = FALSE;
             }
         }

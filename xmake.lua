@@ -1737,6 +1737,14 @@ if is_plat("windows") then
         add_files("src/tools/HidProbeMain.cpp", "src/tools/HidProbePackets.cpp")
     end)
 
+    target("sds-overlapped-io-tests", function()
+        set_kind("binary")
+        set_default(false)
+        add_includedirs("src/windows")
+        add_defines("NOMINMAX", "WIN32_LEAN_AND_MEAN")
+        add_files("tests/OverlappedIoTest.cpp")
+    end)
+
     target("sds-hid-owner-probe", function()
         set_kind("binary")
         set_default(false)

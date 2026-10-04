@@ -1,5 +1,7 @@
 #include <StarfieldDualSense/NativeUsbBackend.h>
 
+#include "OverlappedIo.h"
+
 #include <StarfieldDualSense/DeviceClassifier.h>
 #include <StarfieldDualSense/DualSenseReports.h>
 #include <StarfieldDualSense/HidWriteTrace.h>
@@ -86,7 +88,7 @@ struct sds::NativeUsbBackend::Impl
 
         if (handle != INVALID_HANDLE_VALUE) {
             if (readPending) {
-                CancelIoEx(handle, &overlapped);
+                cancelIoAndWait(handle, overlapped);
             }
             CloseHandle(handle);
             handle = INVALID_HANDLE_VALUE;
@@ -181,7 +183,7 @@ struct sds::NativeUsbBackend::Impl
             if (wait == WAIT_OBJECT_0) {
                 ok = GetOverlappedResult(handle, &writeOverlapped, &bytesWritten, FALSE);
             } else {
-                CancelIoEx(handle, &writeOverlapped);
+                cancelIoAndWait(handle, writeOverlapped);
                 ok = FALSE;
             }
         }
