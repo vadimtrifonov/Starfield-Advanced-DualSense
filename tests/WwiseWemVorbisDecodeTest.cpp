@@ -1,9 +1,12 @@
+#undef NDEBUG
 #include <StarfieldDualSense/WwiseWemVorbisDecode.h>
 #include <StarfieldDualSense/WwiseVorbisRebuild.h>
 
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <future>
 #include <span>
 #include <string>
 #include <vector>
@@ -256,6 +259,30 @@ int main()
     assert(summary.find("expectedSamples=12") != std::string::npos);
     assert(summary.find("decodedSamples=12") != std::string::npos);
     assert(summary.find("sampleCountMatches=yes") != std::string::npos);
+
+    // Exercise the production stb backend concurrently, not just the injected decoder.
+    const auto reference = sds::decodeWwiseVorbisToPcm(
+        fixture.payload, fixture.structure, fixture.packetProbe);
+    assert(reference.reconstructed && reference.backend == "stb_vorbis");
+    std::vector<std::future<bool>> concurrent;
+    for (unsigned thread = 0; thread < 4; ++thread) {
+        concurrent.push_back(std::async(std::launch::async, [&] {
+            for (unsigned iteration = 0; iteration < 32; ++iteration) {
+                const auto result = sds::decodeWwiseVorbisToPcm(
+                    fixture.payload, fixture.structure, fixture.packetProbe);
+                if (result.decodeSucceeded != reference.decodeSucceeded ||
+                    result.error != reference.error || result.pcm != reference.pcm ||
+                    result.channels != reference.channels || result.sampleRate != reference.sampleRate) {
+                    return false;
+                }
+            }
+            return true;
+        }));
+    }
+    for (auto& result : concurrent) {
+        if (result.wait_for(std::chrono::seconds(5)) != std::future_status::ready) std::abort();
+        assert(result.get());
+    }
 
     auto invalidCodebooks = fixture.codebooks;
     invalidCodebooks.resize(3u);

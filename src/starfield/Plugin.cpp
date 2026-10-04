@@ -30,7 +30,7 @@
 #include <StarfieldDualSense/WeaponSfxDiscoveryProbe.h>
 #include <StarfieldDualSense/RemoteVoSpeakerPlayback.h>
 #include <StarfieldDualSense/RemoteVoAudioPreparation.h>
-#include <StarfieldDualSense/RemoteVoOutputPolicy.h>
+#include <StarfieldDualSense/RemoteVoAudioPipeline.h>
 #include <StarfieldDualSense/GameStateAdapter.h>
 #include <StarfieldDualSense/LandVehicleActionGate.h>
 #include <StarfieldDualSense/LandVehicleWwiseReconAggregator.h>
@@ -56,7 +56,7 @@
 #include <StarfieldDualSense/UiSpeakerPreparedCache.h>
 #include <StarfieldDualSense/UiSpeakerPlayback.h>
 #include <StarfieldDualSense/WwiseApiRecon.h>
-#include <StarfieldDualSense/WwisePlayingIdStop.h>
+#include <StarfieldDualSense/WwisePlayingId.h>
 
 #include <RE/Starfield.h>
 #include <SFSE/SFSE.h>
@@ -154,6 +154,8 @@ namespace
     std::shared_ptr<sds::UiSpeakerPreparedCache> g_uiSpeakerPreparedCache;
     std::unique_ptr<sds::UiSpeakerPlayback> g_uiSpeakerPlayback;
     std::chrono::steady_clock::time_point g_remoteVoPlaybackDeadline{};
+    std::unique_ptr<sds::RemoteVoAudioPipeline> g_remoteVoAudioPipeline;
+    bool g_remoteVoBlocked = true;
 
     struct DataslateQueuedVoiceChunk
     {
@@ -607,6 +609,80 @@ namespace
         }
     }
 
+
+    void drainRemoteVoPlayback()
+    {
+        if (!g_remoteVoAudioPipeline || !g_speakerManager) {
+            return;
+        }
+        auto ready = g_remoteVoAudioPipeline->tryTake();
+        if (!ready) {
+            return;
+        }
+
+        const auto& request = ready->request;
+        auto& playback = ready->playback;
+        pluginLog(sds::formatRemoteVoControllerPlaybackPreparation(playback));
+        const auto latencyMs = [&request](std::chrono::steady_clock::time_point when) noexcept -> long long {
+            if (request.captureSteadyMicros <= 0) {
+                return -1;
+            }
+            const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(when.time_since_epoch()).count();
+            return (micros - request.captureSteadyMicros) / 1000;
+        };
+
+        const bool speakerActive = g_speakerManager->active();
+        const auto applied = sds::applyRemoteVoAudio(
+            *ready, *g_speakerManager, resolvedSpeakerVoiceLanguage(),
+            !g_remoteVoBlocked, sds::isWwisePlayingIdActive, sds::stopWwisePlayingId);
+        if (applied.status == sds::RemoteVoPlaybackStatus::Skipped) {
+            return;
+        }
+        const bool submitted = applied.status == sds::RemoteVoPlaybackStatus::Submitted;
+        const auto submitNow = std::chrono::steady_clock::now();
+        const bool replacedActive = submitted &&
+            g_remoteVoPlaybackDeadline.time_since_epoch().count() != 0 &&
+            submitNow < g_remoteVoPlaybackDeadline;
+        if (submitted) {
+            g_remoteVoPlaybackDeadline = submitNow + std::chrono::milliseconds(playback.outputDurationMs);
+        }
+
+        const auto speakerOutputMode = g_speakerManager->outputMode();
+        const bool originalStopIssued = applied.originalStopped;
+
+        const char* outputModeName = speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly
+            ? "ControllerOnly"
+            : "Both";
+        const char* originalOutput = "passthrough-both";
+        if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly) {
+            if (!submitted) {
+                originalOutput = "failsafe-passthrough-submit-rejected";
+            } else {
+                originalOutput = originalStopIssued ? "stopped" : "failsafe-passthrough-stop-unavailable";
+            }
+        }
+
+        char playbackLog[704]{};
+        std::snprintf(
+            playbackLog,
+            sizeof(playbackLog),
+            "Voice controller playback: seq=%llu submit=%s speakerManager=yes speakerActive=%s replacedActive=%s sourceFrames=%u sourceRate=%u outputFrames=%zu outputRate=%u durationMs=%llu captureToPreparedMs=%lld captureToSubmitMs=%lld category=Comms continuous=yes speakerOutputMode=%s originalPlayingId=%u originalOutput=%s",
+            static_cast<unsigned long long>(request.sequence),
+            submitted ? "accepted" : "rejected",
+            speakerActive ? "yes" : "no",
+            replacedActive ? "yes" : "no",
+            playback.sourceFrames,
+            playback.sourceSampleRate,
+            playback.outputFrames,
+            playback.outputSampleRate,
+            static_cast<unsigned long long>(playback.outputDurationMs),
+            latencyMs(ready->preparedAt),
+            latencyMs(submitNow),
+            outputModeName,
+            request.originalPlayingId,
+            originalOutput);
+        pluginLog(playbackLog);
+    }
 
     enum class GamepadProbeKind : std::uint8_t
     {
@@ -2856,6 +2932,10 @@ if (connected && g_controller->bluetoothTransport()) {
             g_audioCapture->stop();
         }
 
+        if (g_remoteVoAudioPipeline) {
+            g_remoteVoAudioPipeline->stop();
+        }
+
         if (g_fireMarkerBridge) {
             g_fireMarkerBridge->stop();
         }
@@ -4847,11 +4927,18 @@ if (connected && g_controller->bluetoothTransport()) {
         if (g_audioCapture) {
             bool dialogueMenuActive = false;
             bool dataslateMenuActive = false;
+            g_remoteVoBlocked = true;
             if (auto* ui = RE::UI::GetSingleton()) {
                 dialogueMenuActive =
                     ui->IsMenuOpen(RE::BSFixedString("DialogueMenu"));
                 dataslateMenuActive =
                     ui->IsMenuOpen(RE::BSFixedString("DataSlateMenu"));
+                g_remoteVoBlocked = ui->IsMenuOpen(RE::BSFixedString("MainMenu")) ||
+                    ui->IsMenuOpen(RE::BSFixedString("LoadingMenu"));
+            }
+            if (g_remoteVoAudioPipeline && (g_remoteVoBlocked || !g_speakerManager ||
+                !g_speakerManager->categoryEnabled(sds::SpeakerCategory::Comms))) {
+                g_remoteVoAudioPipeline->clear();
             }
 
             g_dataslateMenuActive.store(
@@ -5049,6 +5136,7 @@ if (connected && g_controller->bluetoothTransport()) {
                 (pilotActive && g_shipWeaponSemanticCache && g_shipWeaponSemanticCache->ready());
             g_audioCapture->setShipWeaponObservationArmed(shipCaptureArmed);
             g_audioCapture->drainDiagnostics();
+            drainRemoteVoPlayback();
             if (g_musicRecon) {
                 try {
                     g_musicRecon->noteDroppedWwise(g_audioCapture->takeMusicReconDropped());
@@ -6098,8 +6186,13 @@ if (connected && g_controller->bluetoothTransport()) {
             const auto executablePath = currentExecutablePath();
             sds::StarfieldAudioCapture::RemoteVoSourceCallback sourceProbe{};
             if (remoteVoCaptureEnabled) {
+                g_remoteVoAudioPipeline = std::make_unique<sds::RemoteVoAudioPipeline>(
+                    [nativeLog, executablePath](const sds::RemoteVoAudioRequest& request) {
+                        return sds::prepareRemoteVoAudio(
+                            request.filePath, request.codecId, request.language, executablePath, nativeLog);
+                    });
                 sourceProbe = [nativeLog, executablePath](const sds::RemoteVoMirrorRequest& request) {
-                    if (!g_speakerManager ||
+                    if (g_runtimeShutdown || !g_speakerManager ||
                         !g_speakerManager->categoryEnabled(sds::SpeakerCategory::Comms)) {
                         // RemoteVoSourceCallback is a notification callback.
                         // Exit before any filesystem/decode work without
@@ -6108,9 +6201,25 @@ if (connected && g_controller->bluetoothTransport()) {
                     }
                     const bool dataslateVoice =
                         request.eventId == sds::kDataslateVoEventId;
+                    if (!dataslateVoice) {
+                        if (!g_remoteVoBlocked) {
+                            g_remoteVoAudioPipeline->enqueue({
+                                .filePath = std::wstring(request.filePath),
+                                .codecId = request.codecId,
+                                .language = resolvedSpeakerVoiceLanguage(),
+                                .identity = {
+                                    .id = (static_cast<std::uint64_t>(request.eventId) << 32u) | request.externalCookie,
+                                    .controllerOnlySafe = false,
+                                },
+                                .sequence = request.sequence,
+                                .captureSteadyMicros = request.captureSteadyMicros,
+                                .originalPlayingId = request.originalPlayingId,
+                            });
+                        }
+                        return;
+                    }
 
-                    if (dataslateVoice &&
-                        !g_dataslateMenuActive.load(std::memory_order_acquire)) {
+                    if (!g_dataslateMenuActive.load(std::memory_order_acquire)) {
 
                         bool continuationAllowed = false;
                         {
@@ -6138,11 +6247,8 @@ if (connected && g_controller->bluetoothTransport()) {
                     // A fresh exact dataslate VO post is authoritative playback.
                     // This also handles Starfield posting the voice immediately
                     // before its UI_Dataslate_Audio_Play click.
-                    if (dataslateVoice) {
-                        g_dataslatePauseRequested.store(
-                            false,
-                            std::memory_order_release);
-                    }
+                    g_remoteVoAudioPipeline->clear();
+                    g_dataslatePauseRequested.store(false, std::memory_order_release);
 
                     const auto latencyMs = [&request]() noexcept -> long long {
                         if (request.captureSteadyMicros <= 0) {
@@ -6175,8 +6281,7 @@ if (connected && g_controller->bluetoothTransport()) {
                             .controllerOnlySafe = false,
                         };
 
-                        if (dataslateVoice &&
-                            g_dataslateControllerVoiceActive.load(std::memory_order_acquire)) {
+                        if (g_dataslateControllerVoiceActive.load(std::memory_order_acquire)) {
 
                             try {
                                 std::scoped_lock lock(g_dataslateVoiceQueueMutex);
@@ -6215,53 +6320,42 @@ if (connected && g_controller->bluetoothTransport()) {
                         }
                     }
 
-                    const bool replacedActive =
-                        submitted &&
-                        !dataslateVoice &&
-                        g_remoteVoPlaybackDeadline.time_since_epoch().count() != 0 &&
-                        submitNow < g_remoteVoPlaybackDeadline;
                     if (submitted) {
-                        if (dataslateVoice) {
-                            g_dataslateControllerVoiceActive.store(
-                                true,
+                        g_dataslateControllerVoiceActive.store(
+                            true,
+                            std::memory_order_release);
+
+                        if (dataslateQueued) {
+                            char queueLog[256]{};
+                            std::snprintf(
+                                queueLog,
+                                sizeof(queueLog),
+                                "Dataslate controller voice: QUEUED seq=%llu durationMs=%llu pending=%zu reason=native-sequence-advanced-early",
+                                static_cast<unsigned long long>(request.sequence),
+                                static_cast<unsigned long long>(playback.outputDurationMs),
+                                dataslatePendingCount);
+                            nativeLog(queueLog);
+                        } else {
+                            {
+                                std::scoped_lock lock(
+                                    g_dataslateVoiceQueueMutex);
+
+                                g_dataslatePlaybackDeadline =
+                                    submitNow +
+                                    std::chrono::milliseconds(
+                                        playback.outputDurationMs);
+
+                                g_dataslateContinuationDeadline =
+                                    g_dataslatePlaybackDeadline +
+                                    kDataslateContinuationGrace;
+                            }
+
+                            g_dataslatePauseRequested.store(
+                                false,
                                 std::memory_order_release);
 
-                            if (dataslateQueued) {
-                                char queueLog[256]{};
-                                std::snprintf(
-                                    queueLog,
-                                    sizeof(queueLog),
-                                    "Dataslate controller voice: QUEUED seq=%llu durationMs=%llu pending=%zu reason=native-sequence-advanced-early",
-                                    static_cast<unsigned long long>(request.sequence),
-                                    static_cast<unsigned long long>(playback.outputDurationMs),
-                                    dataslatePendingCount);
-                                nativeLog(queueLog);
-                            } else {
-                                {
-                                    std::scoped_lock lock(
-                                        g_dataslateVoiceQueueMutex);
-
-                                    g_dataslatePlaybackDeadline =
-                                        submitNow +
-                                        std::chrono::milliseconds(
-                                            playback.outputDurationMs);
-
-                                    g_dataslateContinuationDeadline =
-                                        g_dataslatePlaybackDeadline +
-                                        kDataslateContinuationGrace;
-                                }
-
-                                g_dataslatePauseRequested.store(
-                                    false,
-                                    std::memory_order_release);
-
-                                nativeLog(
-                                    "Dataslate controller voice: ACTIVE exact-event=0xBDB11FAA");
-                            }
-                        } else {
-                            g_remoteVoPlaybackDeadline = submitNow +
-                                std::chrono::milliseconds(
-                                    playback.outputDurationMs);
+                            nativeLog(
+                                "Dataslate controller voice: ACTIVE exact-event=0xBDB11FAA");
                         }
                     }
 
@@ -6269,54 +6363,15 @@ if (connected && g_controller->bluetoothTransport()) {
                         g_speakerManager ?
                             g_speakerManager->outputMode() :
                             sds::SpeakerOutputMode::Both;
-                    const auto originalAction = sds::decideRemoteVoOriginalOutput(
-                        speakerOutputMode,
-                        submitted,
-                        request.originalPlayingId);
-                    bool originalStopIssued = false;
-                    if (!dataslateVoice &&
-                        originalAction == sds::RemoteVoOriginalOutputAction::StopOriginal) {
-                        originalStopIssued =
-                            sds::stopWwisePlayingId(
-                                request.originalPlayingId);
-                    }
 
                     const char* outputModeName = speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly
                         ? "ControllerOnly"
                         : "Both";
-                    const char* originalOutput = "passthrough-both";
-
-                    if (dataslateVoice) {
-
-                        if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly &&
-
-                            g_audioCapture &&
-
-                            g_audioCapture->dataslateControllerOnlyRoutingActive()) {
-
-                            originalOutput =
-
-                                "silent-emitter-dataslate-native-lifecycle";
-
-                        } else {
-
-                            originalOutput =
-
-                                "passthrough-dataslate-native-lifecycle";
-
-                        }
-
-                    } else if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly) {
-                        if (!submitted) {
-                            originalOutput = "failsafe-passthrough-submit-rejected";
-                        } else if (request.originalPlayingId == 0) {
-                            originalOutput = "failsafe-passthrough-no-playing-id";
-                        } else {
-                            originalOutput = originalStopIssued
-                                ? "stopped"
-                                : "failsafe-passthrough-stop-unavailable";
-                        }
-                    }
+                    const char* originalOutput =
+                        speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly &&
+                        g_audioCapture && g_audioCapture->dataslateControllerOnlyRoutingActive()
+                            ? "silent-emitter-dataslate-native-lifecycle"
+                            : "passthrough-dataslate-native-lifecycle";
 
                     char playbackLog[704]{};
                     std::snprintf(
@@ -6327,7 +6382,7 @@ if (connected && g_controller->bluetoothTransport()) {
                         submitted ? "accepted" : "rejected",
                         speakerManagerPresent ? "yes" : "no",
                         speakerActive ? "yes" : "no",
-                        replacedActive ? "yes" : "no",
+                        "no",
                         playback.sourceFrames,
                         playback.sourceSampleRate,
                         playback.outputFrames,

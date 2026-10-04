@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -30,12 +31,18 @@ namespace
         int decodedChannels = 0;
         int decodedRate = 0;
         short* decoded = nullptr;
-        const int samplesPerChannel = stb_vorbis_decode_memory(
-            ogg.data(),
-            static_cast<int>(ogg.size()),
-            &decodedChannels,
-            &decodedRate,
-            &decoded);
+        int samplesPerChannel = 0;
+        {
+            // stb_vorbis writes its shared CRC table each time it opens a decoder.
+            static std::mutex decodeMutex;
+            std::scoped_lock lock(decodeMutex);
+            samplesPerChannel = stb_vorbis_decode_memory(
+                ogg.data(),
+                static_cast<int>(ogg.size()),
+                &decodedChannels,
+                &decodedRate,
+                &decoded);
+        }
         if (samplesPerChannel < 0 || decoded == nullptr || decodedChannels <= 0 || decodedRate <= 0) {
             std::free(decoded);
             error = "stb_vorbis_decode_memory failed";

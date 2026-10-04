@@ -79,6 +79,8 @@ local core_sources = {
     "src/core/WeaponAudioPipelineBackend.cpp",
     "src/core/RemoteVoSpeakerPlayback.cpp",
     "src/core/RemoteVoAudioPreparation.cpp",
+    "src/core/RemoteVoAudioPipeline.cpp",
+    "src/core/RemoteVoAudioPlayback.cpp",
     "src/core/WwiseReconSelection.cpp",
     "src/core/WwiseCallgraphAnalysis.cpp",
     "src/core/WwiseCanarySafety.cpp",
@@ -1035,6 +1037,13 @@ target("sds-wwise-vorbis-packet-probe-tests", function()
         "src/core/WwiseWemVorbisPacketProbe.cpp")
 end)
 
+target("sds-remote-vo-audio-pipeline-tests", function()
+    set_kind("binary")
+    set_default(false)
+    add_includedirs("include")
+    add_files("tests/RemoteVoAudioPipelineTest.cpp", "src/core/RemoteVoAudioPipeline.cpp")
+end)
+
 target("sds-remote-vo-audio-preparation-tests", function()
     set_kind("binary")
     set_default(false)
@@ -1082,7 +1091,12 @@ target("sds-remote-vo-output-policy-tests", function()
     set_kind("binary")
     set_default(false)
     add_includedirs("include")
-    add_files("tests/RemoteVoOutputPolicyTest.cpp")
+    add_files(
+        "tests/RemoteVoOutputPolicyTest.cpp",
+        "src/core/RemoteVoAudioPlayback.cpp",
+        "src/core/ControllerSpeakerManager.cpp",
+        "src/core/SpeakerEventClassifier.cpp",
+        "src/core/Config.cpp")
 end)
 
 target("sds-wwise-vorbis-decode-tests", function()
@@ -1802,7 +1816,7 @@ if os.isfile("external/CommonLibSF/xmake.lua") then
             "src/starfield/WwiseSecondaryOutputCanary.cpp",
             "src/starfield/WwiseSpatialOutputProbe.cpp",
             "src/starfield/WwiseRemoteVoMirror.cpp",
-            "src/starfield/WwisePlayingIdStop.cpp",
+            "src/starfield/WwisePlayingId.cpp",
             "src/core/SettingsService.cpp",
             "src/starfield/SettingsMenu.cpp",
             "src/starfield/Plugin.cpp")
