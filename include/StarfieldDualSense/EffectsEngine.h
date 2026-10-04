@@ -3,6 +3,7 @@
 #include <StarfieldDualSense/Config.h>
 #include <StarfieldDualSense/ControllerLiveSettings.h>
 #include <StarfieldDualSense/Types.h>
+#include <StarfieldDualSense/GameplayFeedbackGate.h>
 #include <StarfieldDualSense/WeaponProfiles.h>
 
 #include <chrono>
@@ -62,6 +63,7 @@ namespace sds
         [[nodiscard]] TriggerEffect landVehicleAimTrigger() const noexcept;
         [[nodiscard]] std::chrono::milliseconds firePulseDuration() const noexcept;
         void restorePersistentTrigger() noexcept;
+        void clearTransientTriggerState() noexcept;
         void clearOnFootPersistentState() noexcept;
         void clearLandVehicleProductionState() noexcept;
 
@@ -72,6 +74,7 @@ namespace sds
             Landing
         };
 
+        GameplayFeedbackGate _feedbackGate;
         Config _config{};
         EffectState _state{};
         bool _weaponEquipped{ false };
@@ -90,13 +93,11 @@ namespace sds
         bool _landVehicleProductionActive{ false };
         bool _landVehicleAimActive{ false };
         std::uint64_t _landVehicleProductionEpoch{ 0 };
-        std::uint8_t _landVehicleBlockingMenuMask{ 0 };
         std::chrono::steady_clock::time_point _landVehicleGunRecoilDeadline{};
         bool _persistentContextSuppressed{ false };
         bool _shipR2BallisticConfirmed{ false };
         bool _shipLaserActive{ false };
         std::chrono::steady_clock::time_point _shipLaserLeaseDeadline{};
-        std::uint8_t _shipBlockingMenuMask{ 0 };
         bool _shipEMTriggerRearmed{ true };
         bool _shipLaunchLandingHapticsActive{ false };
         ShipEMTriggerRefreshPhase _shipEMTriggerRefreshPhase{ ShipEMTriggerRefreshPhase::None };

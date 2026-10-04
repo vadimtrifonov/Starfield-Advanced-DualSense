@@ -285,6 +285,18 @@ int main()
             backend->continuous.back().kind == sds::HapticContinuousKind::BoostpackThrust,
         "global live re-enable restores active boostpack body without reconstruction");
 
+    std::fill(menu.text.begin(), menu.text.end(), '\0');
+    std::string_view("GalaxyStarMapMenu").copy(menu.text.data(), 17);
+    menu.type = sds::GameEventType::MenuOpened;
+    check(manager.handle(menu), "star map interrupts boostpack thrust");
+    menu.type = sds::GameEventType::MenuClosed;
+    check(manager.handle(menu) &&
+        backend->continuous.back().kind == sds::HapticContinuousKind::None,
+        "closing a blocking menu does not revive old boostpack authority");
+    check(manager.startBoostpackThrust() &&
+        backend->continuous.back().kind == sds::HapticContinuousKind::BoostpackThrust,
+        "fresh thrust authority can resume after the menu");
+
     check(manager.stopBoostpackThrust(),
         "production stop clears authoritative boostpack thrust body");
     check(

@@ -70,6 +70,7 @@ namespace sds
     private:
         void log(std::string_view message) const noexcept;
         void clearOnFootContextStateLocked() noexcept;
+        void clearSustainedFireLocked() noexcept;
         [[nodiscard]] HapticContinuousState composeContinuousLocked() noexcept;
         [[nodiscard]] bool submitContinuousLocked() noexcept;
         [[nodiscard]] HapticContinuousState composeOnFootContinuousLocked() noexcept;
@@ -94,7 +95,6 @@ namespace sds
         bool _shipPilotActive{ false };
         bool _landVehicleContextActive{ false };
         bool _shipContextSuppressed{ false };
-        std::uint8_t _shipBlockingMenuMask{ 0 };
         HapticContinuousState _shipPropulsionContinuous{};
         LandVehicleControllerFeel _landVehicleFeel{};
         LandVehicleMotionState _landVehicleMotion{};
@@ -116,8 +116,6 @@ namespace sds
         std::chrono::steady_clock::time_point _cutterStartDeadline{};
         bool _cutterHeartbeatArmed{ false };
         std::chrono::steady_clock::time_point _cutterHeartbeatDeadline{};
-        std::atomic_bool _reloadPaused{ false };
-        std::atomic<std::uint8_t> _reloadBlockingMenus{ 0u };
         bool _started{ false };
     };
 }

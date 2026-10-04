@@ -9,10 +9,6 @@
 
 namespace
 {
-    constexpr std::uint8_t kDataMenuBit = 1U << 0;
-    constexpr std::uint8_t kPauseMenuBit = 1U << 1;
-    constexpr std::uint8_t kLoadingMenuBit = 1U << 2;
-    constexpr std::uint8_t kGalaxyStarMapMenuBit = 1U << 3;
 
     std::string_view eventText(const sds::GameEvent& event) noexcept
     {
@@ -21,23 +17,6 @@ namespace
             ++length;
         }
         return { event.text.data(), length };
-    }
-
-    std::uint8_t blockingMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "DataMenu") {
-            return kDataMenuBit;
-        }
-        if (menu == "PauseMenu") {
-            return kPauseMenuBit;
-        }
-        if (menu == "LoadingMenu") {
-            return kLoadingMenuBit;
-        }
-        if (menu == "GalaxyStarMapMenu") {
-            return kGalaxyStarMapMenuBit;
-        }
-        return 0;
     }
 
     float incomingDamagePerceptualGain(float severity) noexcept
@@ -78,12 +57,7 @@ bool sds::HapticsEngine::setWeaponHapticsConfig(const Config& config) noexcept
          !sds::weaponHapticsFamilyEnabled(
              _weaponHapticsConfig,
              _equipped->triggerFamily))) {
-        _cutterBeamAuthorized = false;
-        _arcWelderAuthorized = false;
-        _penumbraStressActive = false;
-        _magsniperChargeActive = false;
-        _novablastChargeAuthorized = false;
-        _autoRivetChargeAuthorized = false;
+        clearWeaponFeedback();
     }
 
     return changed;
@@ -107,47 +81,39 @@ float sds::HapticsEngine::reloadHapticsFamilyScale(
         useCustomReloadProfile);
 }
 
+void sds::HapticsEngine::clearWeaponFeedback() noexcept
+{
+    _cutterBeamAuthorized = false;
+    _arcWelderAuthorized = false;
+    _penumbraStressActive = false;
+    _magsniperChargeActive = false;
+    _novablastChargeAuthorized = false;
+    _autoRivetChargeAuthorized = false;
+}
+
 std::optional<sds::HapticCommand> sds::HapticsEngine::handle(const GameEvent& event) noexcept
 {
+    if (_feedbackGate.handle(event)) {
+        if (_feedbackGate.blocked()) clearWeaponFeedback();
+        return std::nullopt;
+    }
     if (event.type == GameEventType::WeaponEquipped) {
-        _cutterBeamAuthorized = false;
-        _arcWelderAuthorized = false;
-        _penumbraStressActive = false;
-        _magsniperChargeActive = false;
-        _novablastChargeAuthorized = false;
-        _autoRivetChargeAuthorized = false;
+        clearWeaponFeedback();
         _customWeaponEquipped = isCustomWeaponProfileMatch(eventText(event));
         _equipped = findWeaponProfile(eventText(event));
         _equippedFormId = event.formId;
         return std::nullopt;
     }
-    if (event.type == GameEventType::GamePaused) {
-        _cutterBeamAuthorized = false;
-        _arcWelderAuthorized = false;
-        _penumbraStressActive = false;
-        _magsniperChargeActive = false;
-        _novablastChargeAuthorized = false;
-        _autoRivetChargeAuthorized = false;
-        _gamePaused = true;
+    if (event.type == GameEventType::Shutdown) {
+        clearWeaponFeedback();
+        _equipped = nullptr;
+        _customWeaponEquipped = false;
+        _equippedFormId = 0;
+        _feedbackGate = {};
         return std::nullopt;
     }
-    if (event.type == GameEventType::GameUnpaused) {
-        _gamePaused = false;
-        return std::nullopt;
-    }
-    if (event.type == GameEventType::MenuOpened ||
-        event.type == GameEventType::MenuClosed) {
-        const auto bit = blockingMenuBit(eventText(event));
-        if (bit != 0) {
-            if (event.type == GameEventType::MenuOpened) {
-                _blockingMenuMask = static_cast<std::uint8_t>(_blockingMenuMask | bit);
-                _autoRivetChargeAuthorized = false;
-            } else {
-                _blockingMenuMask = static_cast<std::uint8_t>(_blockingMenuMask & ~bit);
-            }
-        }
-        return std::nullopt;
-    }
+    if (_feedbackGate.blocked()) return std::nullopt;
+
     if (event.type == GameEventType::IncomingDamage) {
         if (!std::isfinite(event.value) || event.value <= 0.0F) {
             return std::nullopt;
@@ -159,20 +125,6 @@ std::optional<sds::HapticCommand> sds::HapticsEngine::handle(const GameEvent& ev
             .gain = sds::clampHapticGain(severityGain * _hapticStrength),
             .when = event.when,
         };
-    }
-    if (event.type == GameEventType::Shutdown) {
-        _cutterBeamAuthorized = false;
-        _arcWelderAuthorized = false;
-        _penumbraStressActive = false;
-        _magsniperChargeActive = false;
-        _novablastChargeAuthorized = false;
-        _autoRivetChargeAuthorized = false;
-        _equipped = nullptr;
-        _customWeaponEquipped = false;
-        _equippedFormId = 0;
-        _gamePaused = false;
-        _blockingMenuMask = 0;
-        return std::nullopt;
     }
     if (!_equipped ||
         (_customWeaponEquipped && !_weaponHapticsConfig.customWeaponsEnabled)) {
@@ -230,9 +182,7 @@ std::optional<sds::HapticCommand> sds::HapticsEngine::handle(const GameEvent& ev
     if (_equipped->name == "Auto-Rivet") {
         const auto marker = eventText(event);
         if (marker == "AutoRivetChargeStart") {
-            if (!_gamePaused && _blockingMenuMask == 0) {
-                _autoRivetChargeAuthorized = true;
-            }
+            _autoRivetChargeAuthorized = true;
             return std::nullopt;
         }
         if (marker == "AutoRivetChargeStop") {
@@ -331,7 +281,7 @@ std::optional<sds::HapticCommand> sds::HapticsEngine::handle(const GameEvent& ev
 
 sds::HapticContinuousState sds::HapticsEngine::handleRightTriggerInput(std::uint8_t r2) noexcept
 {
-    if (_gamePaused) {
+    if (_feedbackGate.blocked()) {
         return {};
     }
 
@@ -343,12 +293,7 @@ sds::HapticContinuousState sds::HapticsEngine::handleRightTriggerInput(std::uint
     if (!sds::weaponHapticsFamilyEnabled(
             _weaponHapticsConfig,
             _equipped->triggerFamily)) {
-        _cutterBeamAuthorized = false;
-        _arcWelderAuthorized = false;
-        _penumbraStressActive = false;
-        _magsniperChargeActive = false;
-        _novablastChargeAuthorized = false;
-        _autoRivetChargeAuthorized = false;
+        clearWeaponFeedback();
         return {};
     }
 
@@ -358,7 +303,7 @@ sds::HapticContinuousState sds::HapticsEngine::handleRightTriggerInput(std::uint
             _equipped->triggerFamily);
 
     if (_equipped && _equipped->name == "Auto-Rivet") {
-        if (_blockingMenuMask != 0 || !_autoRivetChargeAuthorized || r2 < 24) {
+        if (!_autoRivetChargeAuthorized || r2 < 24) {
             return {};
         }
 

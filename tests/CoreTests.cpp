@@ -1141,10 +1141,18 @@ UnknownFutureOption = 123
         expect(queue.push(a), "event queue accepts first event");
         expect(queue.push(b), "event queue accepts second event");
         expect(!queue.push(c), "event queue drops newest on overflow");
+        sds::GameEvent closed{}; closed.type = sds::GameEventType::MenuClosed;
+        expect(queue.push(closed), "event queue keeps menu close on overflow");
+        expect(queue.push(a), "event queue keeps menu open on overflow");
+        expect(!queue.push(c), "event queue drops other events above capacity");
         const auto first = queue.tryPop();
         const auto second = queue.tryPop();
+        const auto third = queue.tryPop();
+        const auto fourth = queue.tryPop();
         expect(first && first->type == sds::GameEventType::MenuOpened, "event queue preserves FIFO first");
         expect(second && second->type == sds::GameEventType::WeaponFired, "event queue preserves FIFO second");
+        expect(third && third->type == sds::GameEventType::MenuClosed, "event queue preserves FIFO for kept menu close");
+        expect(fourth && fourth->type == sds::GameEventType::MenuOpened, "event queue preserves FIFO for kept menu open");
         expect(!queue.tryPop().has_value(), "event queue empty returns nullopt");
         queue.stop();
         expect(queue.stopped(), "event queue reports stopped");

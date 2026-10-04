@@ -15,10 +15,14 @@ namespace sds
     public:
         static_assert(Capacity > 0);
 
+        // Consumers track menu state from open/close edges, so dropping one leaves them
+        // stale until the menu cycles again. Capacity limits only other events.
         bool push(GameEvent event)
         {
+            const bool menuEdge =
+                event.type == GameEventType::MenuOpened || event.type == GameEventType::MenuClosed;
             std::scoped_lock lock(_mutex);
-            if (_stopped || _queue.size() >= Capacity) {
+            if (_stopped || (_queue.size() >= Capacity && !menuEdge)) {
                 return false;
             }
             _queue.push_back(std::move(event));

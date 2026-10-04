@@ -6,6 +6,7 @@ haptics_engine = (root / "src/core/HapticsEngine.cpp").read_text(encoding="utf-8
 haptics_manager = (root / "src/core/HapticsManager.cpp").read_text(encoding="utf-8")
 effects_engine = (root / "src/core/EffectsEngine.cpp").read_text(encoding="utf-8")
 plugin = (root / "src/starfield/Plugin.cpp").read_text(encoding="utf-8")
+feedback_gate = (root / "include/StarfieldDualSense/GameplayFeedbackGate.h").read_text(encoding="utf-8")
 
 checks = [
     (
@@ -13,19 +14,18 @@ checks = [
         'constexpr std::string_view kVersion = "0.6.2";' in plugin,
     ),
     (
-        "general haptics reserves a distinct galaxy-map blocking bit",
-        "constexpr std::uint8_t kGalaxyStarMapMenuBit = 1U << 3;" in haptics_engine,
+        "shared feedback policy includes GalaxyStarMapMenu",
+        '"GalaxyStarMapMenu"' in feedback_gate,
     ),
     (
-        "general haptics classifies GalaxyStarMapMenu as blocking",
-        'if (menu == "GalaxyStarMapMenu") {\n            return kGalaxyStarMapMenuBit;\n        }'
-        in haptics_engine,
+        "general haptics use shared menu suspension",
+        "_feedbackGate.handle(event)" in haptics_engine
+        and "_feedbackGate.blocked()" in haptics_engine,
     ),
     (
-        "ship haptics classify GalaxyStarMapMenu as blocking",
-        haptics_manager.count(
-            'if (menu == "GalaxyStarMapMenu") {\n            return 0x8u;\n        }'
-        ) >= 2,
+        "ship haptics use shared gameplay and transition suspension",
+        "_engine.gameplayBlocked()" in haptics_manager
+        and "_engine.shipTransitionBlocked()" in haptics_manager,
     ),
     (
         "ship map-open path clears live propulsion",
@@ -42,10 +42,9 @@ checks = [
         and "_landVehicleFeel.reset();" in haptics_manager,
     ),
     (
-        "ship adaptive-trigger path classifies GalaxyStarMapMenu as blocking",
-        effects_engine.count(
-            'if (menu == "GalaxyStarMapMenu") {\n            return 0x8u;\n        }'
-        ) >= 2,
+        "ship adaptive-trigger path uses shared menu suspension",
+        "_feedbackGate.handle(event)" in effects_engine
+        and "_feedbackGate.blocked()" in effects_engine,
     ),
     (
         "ship map-open path clears adaptive triggers",

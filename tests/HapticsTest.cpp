@@ -1502,6 +1502,29 @@ int main()
             "GamePaused immediately clears Cutter continuous backend state");
     }
 
+    auto cutterResume = cutterPause;
+    cutterResume.type = sds::GameEventType::GameUnpaused;
+    (void)cutterManager.handle(cutterResume);
+    const auto resumedStart = now + std::chrono::seconds(10);
+    (void)cutterManager.handleRightTriggerInput(200, resumedStart);
+    (void)cutterManager.handle(fireMarker("weaponFireStart", resumedStart));
+    expect(cutterManagerState->continuous.kind == sds::HapticContinuousKind::CutterBeam,
+        "fresh Cutter fire resumes after pause without re-equipping");
+    (void)cutterManager.tick(resumedStart + std::chrono::seconds(1));
+    expect(cutterManagerState->continuous.kind == sds::HapticContinuousKind::None,
+        "pause preserves the equipped Cutter's watchdog eligibility");
+
+    const auto pendingStart = resumedStart + std::chrono::seconds(2);
+    (void)cutterManager.handleRightTriggerInput(0, pendingStart - std::chrono::milliseconds(1));
+    (void)cutterManager.handle(fireMarker("weaponFireStart", pendingStart));
+    (void)cutterManager.handleRightTriggerInput(0, pendingStart - std::chrono::milliseconds(1));
+    (void)cutterManager.handleRightTriggerInput(200, pendingStart + std::chrono::milliseconds(1));
+    expect(cutterManagerState->continuous.kind == sds::HapticContinuousKind::CutterBeam,
+        "fresh held input resolves marker-first Cutter start");
+    (void)cutterManager.tick(pendingStart + std::chrono::seconds(1));
+    expect(cutterManagerState->continuous.kind == sds::HapticContinuousKind::None,
+        "a stale pre-marker release cannot disarm the newer watchdog");
+
     (void)cutterManager.handle(equip("Cutter"));
     (void)cutterManager.handleRightTriggerInput(200);
     (void)cutterManager.handle(fireMarker("weaponFireStart", now));

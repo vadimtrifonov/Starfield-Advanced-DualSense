@@ -29,47 +29,6 @@ namespace
         return { event.text.data(), length };
     }
 
-    std::uint8_t reloadBlockingMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "DataMenu") { return 0x01u; }
-        if (menu == "PauseMenu") { return 0x02u; }
-        if (menu == "LoadingMenu") { return 0x04u; }
-        if (menu == "FaderMenu") { return 0x08u; }
-        if (menu == "MainMenu") { return 0x10u; }
-        if (menu == "CharGenMenu" || menu == "ChargenMenu") { return 0x20u; }
-        return 0u;
-    }
-
-    std::uint8_t shipBlockingMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "DataMenu") {
-            return 0x1u;
-        }
-        if (menu == "PauseMenu") {
-            return 0x2u;
-        }
-        if (menu == "GalaxyStarMapMenu") {
-            return 0x8u;
-        }
-        return 0u;
-    }
-
-    std::uint8_t landVehicleBlockingMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "DataMenu") {
-            return 0x1u;
-        }
-        if (menu == "PauseMenu") {
-            return 0x2u;
-        }
-        if (menu == "LoadingMenu") {
-            return 0x4u;
-        }
-        if (menu == "GalaxyStarMapMenu") {
-            return 0x8u;
-        }
-        return 0u;
-    }
 }
 
 sds::HapticsManager::HapticsManager(Config config, BackendFactory backendFactory, LogCallback log) :
@@ -189,10 +148,19 @@ void sds::HapticsManager::applyLiveSettings(
         log("Haptics: live settings apply failed; existing controller features unaffected");
     }
 }
+void sds::HapticsManager::clearSustainedFireLocked() noexcept
+{
+    _cutterStartPending = false;
+    _cutterStartWhen = {};
+    _cutterStartDeadline = {};
+    _cutterHeartbeatArmed = false;
+    _cutterHeartbeatDeadline = {};
+}
+
 void sds::HapticsManager::clearOnFootContextStateLocked() noexcept
 {
     GameEvent reset{};
-    reset.type = GameEventType::Shutdown;
+    reset.type = GameEventType::WeaponEquipped;
     (void)_engine.handle(reset);
     (void)_engine.handleRightTriggerInput(0);
     _lastR2 = 0;
@@ -200,11 +168,7 @@ void sds::HapticsManager::clearOnFootContextStateLocked() noexcept
     _boostpackThrustActive = false;
     _cutterHeartbeatEligible = false;
     _arcWelderFireEndEligible = false;
-    _cutterStartPending = false;
-    _cutterStartWhen = {};
-    _cutterStartDeadline = {};
-    _cutterHeartbeatArmed = false;
-    _cutterHeartbeatDeadline = {};
+    clearSustainedFireLocked();
 }
 
 
@@ -213,6 +177,7 @@ sds::HapticContinuousState sds::HapticsManager::composeContinuousLocked() noexce
     if (_shipPilotActive || _shipLaunchLandingRumbleActive) {
         return composeShipContinuousLocked();
     }
+    if (_engine.gameplayBlocked()) return {};
     if (_landVehicleContextActive) {
         return composeLandVehicleContinuousLocked();
     }
@@ -253,14 +218,11 @@ sds::HapticContinuousState sds::HapticsManager::composeOnFootContinuousLocked() 
 }
 sds::HapticContinuousState sds::HapticsManager::composeShipContinuousLocked() const noexcept
 {
-    if (_shipBlockingMenuMask != 0) {
-        return {};
-    }
-
     const float hapticStrength =
         _hapticStrength.load(std::memory_order_acquire);
 
     if (_shipLaunchLandingRumbleActive) {
+        if (_engine.shipTransitionBlocked()) return {};
         return {
             .kind = HapticContinuousKind::ShipBoost,
             .gain = std::clamp(kShipLaunchLandingRumbleGain * hapticStrength, 0.0F, 1.0F),
@@ -269,7 +231,7 @@ sds::HapticContinuousState sds::HapticsManager::composeShipContinuousLocked() co
         };
     }
 
-    if (!_shipPilotActive) {
+    if (!_shipPilotActive || _engine.gameplayBlocked()) {
         return {};
     }
 
@@ -282,7 +244,7 @@ sds::HapticContinuousState sds::HapticsManager::composeShipContinuousLocked() co
 sds::HapticContinuousState sds::HapticsManager::composeLandVehicleContinuousLocked() const noexcept
 {
     if (!_landVehicleProductionActive || !_landVehicleContextActive || _shipPilotActive ||
-        _shipBlockingMenuMask != 0 || !_landVehicleMotion.authorityActive ||
+        _engine.gameplayBlocked() || !_landVehicleMotion.authorityActive ||
         _landVehicleProductionEpoch == 0 ||
         _landVehicleMotion.authorityEpoch != _landVehicleProductionEpoch) {
         return {};
@@ -375,7 +337,6 @@ void sds::HapticsManager::stop() noexcept
         _shipPilotActive = false;
         _landVehicleContextActive = false;
         _shipContextSuppressed = false;
-        _shipBlockingMenuMask = 0;
         _shipPropulsionContinuous = {};
         _shipLaunchLandingRumbleActive = false;
         clearShipLaserLocked();
@@ -399,28 +360,41 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
             const auto type = event.type;
             const auto marker = eventText(event);
 
-            // Reload stages are player Wwise events, not raw button presses.
-            // These masks prevent delayed speaker cues from vibrating during
-            // paused, nested or transition menus.
-            if (type == GameEventType::GamePaused || type == GameEventType::Shutdown) {
-                _reloadPaused.store(true, std::memory_order_release);
-            } else if (type == GameEventType::GameUnpaused) {
-                _reloadPaused.store(false, std::memory_order_release);
-            }
-            const auto reloadBit = reloadBlockingMenuBit(marker);
-            if (reloadBit != 0u && type == GameEventType::MenuOpened) {
-                _reloadBlockingMenus.fetch_or(reloadBit, std::memory_order_acq_rel);
-            } else if (reloadBit != 0u && type == GameEventType::MenuClosed) {
-                _reloadBlockingMenus.fetch_and(
-                    static_cast<std::uint8_t>(~reloadBit), std::memory_order_acq_rel);
-            }
-
-            if (type == GameEventType::ShipPilotEntered ||
+            if (type == GameEventType::MenuOpened || type == GameEventType::MenuClosed ||
+                type == GameEventType::GamePaused || type == GameEventType::GameUnpaused) {
+                (void)_engine.handle(event);
+                if (_engine.gameplayBlocked()) {
+                    _lastR2 = 0;
+                    _lastR2When = {};
+                    clearSustainedFireLocked();
+                    _boostpackThrustActive = false;
+                    _shipPropulsionContinuous = {};
+                    clearShipLaserLocked();
+                    _landVehicleMotion = {};
+                    _landVehicleContinuous = {};
+                    _landVehicleForwardBoostActive = false;
+                    _landVehicleVerticalThrustActive = false;
+                    _landVehicleForwardBoostDeadline = {};
+                    _landVehicleVerticalThrustDeadline = {};
+                    _landVehicleFeel.reset();
+                }
+                if (type == GameEventType::MenuOpened && marker == "LoadingMenu") {
+                    clearLandVehicleProductionLocked();
+                }
+                if (type == GameEventType::MenuOpened && marker == "MainMenu") {
+                    _shipLaunchLandingRumbleActive = false;
+                }
+                if (type == GameEventType::MenuClosed && marker == "LoadingMenu" &&
+                    !_shipPilotActive && !_landVehicleContextActive) {
+                    _shipContextSuppressed = false;
+                }
+                continuous = HapticContinuousState{};
+                contextHandled = true;
+            } else if (type == GameEventType::ShipPilotEntered ||
                 type == GameEventType::ShipPilotResumed) {
                 _shipPilotActive = true;
                 _landVehicleContextActive = false;
                 _shipContextSuppressed = true;
-                _shipBlockingMenuMask = 0;
                 _shipPropulsionContinuous = {};
                 clearShipLaserLocked();
                 clearLandVehicleProductionLocked();
@@ -432,7 +406,6 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 _shipPilotActive = false;
                 _landVehicleContextActive = false;
                 _shipContextSuppressed = true;
-                _shipBlockingMenuMask = 0;
                 _shipPropulsionContinuous = {};
                 clearShipLaserLocked();
                 clearLandVehicleProductionLocked();
@@ -442,7 +415,6 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
             } else if (type == GameEventType::ShipPilotExited) {
                 if (_shipPilotActive) {
                     _shipPilotActive = false;
-                    _shipBlockingMenuMask = 0;
                     _shipPropulsionContinuous = {};
                     clearShipLaserLocked();
                     clearOnFootContextStateLocked();
@@ -484,26 +456,12 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 clearLandVehicleProductionLocked();
                 continuous = HapticContinuousState{};
                 contextHandled = true;
-            } else if (_landVehicleContextActive &&
-                       (type == GameEventType::MenuOpened || type == GameEventType::MenuClosed) &&
-                       landVehicleBlockingMenuBit(marker) != 0) {
-                const auto bit = landVehicleBlockingMenuBit(marker);
-                if (type == GameEventType::MenuOpened) {
-                    _shipBlockingMenuMask = static_cast<std::uint8_t>(_shipBlockingMenuMask | bit);
-                    _landVehicleMotion = {};
-                    _landVehicleContinuous = {};
-                    _landVehicleFeel.reset();
-                    if (marker == "LoadingMenu") {
-                        clearLandVehicleProductionLocked();
-                    }
-                } else {
-                    _shipBlockingMenuMask = static_cast<std::uint8_t>(_shipBlockingMenuMask & ~bit);
-                }
-                continuous = HapticContinuousState{};
+            } else if (_engine.gameplayBlocked() && type != GameEventType::Shutdown &&
+                       type != GameEventType::WeaponEquipped && type != GameEventType::ShipTouchdown) {
                 contextHandled = true;
             } else if (type == GameEventType::LandVehicleTouchdown) {
                 if (_landVehicleProductionActive && _landVehicleContextActive && !_shipPilotActive &&
-                    _shipBlockingMenuMask == 0 && _landVehicleProductionEpoch != 0) {
+                    !_engine.gameplayBlocked() && _landVehicleProductionEpoch != 0) {
                     command = HapticCommand{
                         .kind = HapticEffectKind::LandVehicleTouchdownThump,
                         .gain = std::clamp(
@@ -514,7 +472,7 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 contextHandled = true;
             } else if (type == GameEventType::LandVehicleGunFired) {
                 if (_landVehicleProductionActive && _landVehicleContextActive && !_shipPilotActive &&
-                    _shipBlockingMenuMask == 0 && _landVehicleProductionEpoch != 0) {
+                    !_engine.gameplayBlocked() && _landVehicleProductionEpoch != 0) {
                     command = HapticCommand{
                         .kind = HapticEffectKind::LandVehicleGunRecoil,
                         .gain = std::clamp(0.72F * _hapticStrength.load(std::memory_order_acquire), 0.0F, sds::kHapticOverdriveGainMax),
@@ -524,7 +482,7 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 contextHandled = true;
             } else if (type == GameEventType::LandVehicleBoostStarted) {
                 if (_landVehicleProductionActive && _landVehicleContextActive && !_shipPilotActive &&
-                    _shipBlockingMenuMask == 0 && _landVehicleProductionEpoch != 0) {
+                    !_engine.gameplayBlocked() && _landVehicleProductionEpoch != 0) {
                     command = HapticCommand{
                         .kind = HapticEffectKind::LandVehicleBoostKick,
                         .gain = std::clamp(0.78F * _hapticStrength.load(std::memory_order_acquire), 0.0F, sds::kHapticOverdriveGainMax),
@@ -532,25 +490,8 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                     };
                 }
                 contextHandled = true;
-            } else if ((_shipPilotActive || _shipLaunchLandingRumbleActive) &&
-                       (type == GameEventType::MenuOpened || type == GameEventType::MenuClosed) &&
-                       shipBlockingMenuBit(marker) != 0) {
-                const auto bit = shipBlockingMenuBit(marker);
-                if (type == GameEventType::MenuOpened) {
-                    _shipBlockingMenuMask = static_cast<std::uint8_t>(_shipBlockingMenuMask | bit);
-                    _shipPropulsionContinuous = {};
-                    clearShipLaserLocked();
-                } else {
-                    _shipBlockingMenuMask = static_cast<std::uint8_t>(_shipBlockingMenuMask & ~bit);
-                }
-                continuous = composeShipContinuousLocked();
-                contextHandled = true;
-            } else if (type == GameEventType::MenuClosed && !_shipPilotActive &&
-                       !_landVehicleContextActive && _shipContextSuppressed && marker == "LoadingMenu") {
-                _shipContextSuppressed = false;
-                contextHandled = true;
             } else if (type == GameEventType::ShipBallisticWeaponFired) {
-                if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                     clearShipLaserLocked();
                     command = HapticCommand{
                         .kind = HapticEffectKind::ShipBallisticCannonKick,
@@ -561,7 +502,7 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 }
                 contextHandled = true;
             } else if (type == GameEventType::ShipLaserWeaponFired) {
-                if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                     _shipLaserActive = true;
                     _shipLaserLeaseDeadline = event.when + kShipLaserHeartbeatLease;
                     command = HapticCommand{
@@ -573,13 +514,13 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 }
                 contextHandled = true;
             } else if (type == GameEventType::ShipLaserWeaponStopped) {
-                if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                     clearShipLaserLocked();
                     continuous = composeShipContinuousLocked();
                 }
                 contextHandled = true;
             } else if (type == GameEventType::ShipParticleWeaponFired) {
-                if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                     clearShipLaserLocked();
                     command = HapticCommand{
                         .kind = HapticEffectKind::ShipParticlePulse,
@@ -590,7 +531,7 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 }
                 contextHandled = true;
             } else if (type == GameEventType::ShipMissileWeaponFired) {
-                if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                     clearShipLaserLocked();
                     command = HapticCommand{
                         .kind = HapticEffectKind::ShipMissileLaunchThump,
@@ -601,7 +542,7 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 }
                 contextHandled = true;
             } else if (type == GameEventType::ShipEMWeaponFired) {
-                if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                     clearShipLaserLocked();
                     command = HapticCommand{
                         .kind = HapticEffectKind::ShipEMPulse,
@@ -614,13 +555,13 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
             } else if (type == GameEventType::ShipTouchdown) {
                 _shipLaunchLandingRumbleActive = false;
                 continuous = composeShipContinuousLocked();
-                command = HapticCommand{
+                if (!_engine.shipTransitionBlocked()) command = HapticCommand{
                     .kind = HapticEffectKind::ShipTouchdownThump,
                     .gain = std::clamp(0.90F * _hapticStrength.load(std::memory_order_acquire), 0.0F, sds::kHapticOverdriveGainMax),
                     .when = event.when,
                 };
                 contextHandled = true;
-            } else if (_shipContextSuppressed && type != GameEventType::Shutdown) {
+            } else if ((_shipContextSuppressed || _shipLaunchLandingRumbleActive) && type != GameEventType::Shutdown) {
                 contextHandled = true;
             }
 
@@ -629,7 +570,6 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
             }
 
             if (!contextHandled && (type == GameEventType::WeaponEquipped ||
-                type == GameEventType::GamePaused ||
                 type == GameEventType::Shutdown)) {
                 if (type == GameEventType::WeaponEquipped) {
                     const auto* profile = findWeaponProfile(marker);
@@ -639,11 +579,7 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                     _cutterHeartbeatEligible = false;
                     _arcWelderFireEndEligible = false;
                 }
-                _cutterStartPending = false;
-                _cutterStartWhen = {};
-                _cutterStartDeadline = {};
-                _cutterHeartbeatArmed = false;
-                _cutterHeartbeatDeadline = {};
+                clearSustainedFireLocked();
             }
 
             if (!contextHandled && type == GameEventType::WeaponFired && marker == "weaponFireStart") {
@@ -702,8 +638,8 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
             if (!contextHandled && type == GameEventType::Shutdown) {
                 _shipPilotActive = false;
                 _landVehicleContextActive = false;
-                _shipContextSuppressed = false;
-                _shipBlockingMenuMask = 0;
+                // No gameplay owner remains to authorize late native cues.
+                _shipContextSuppressed = true;
                 clearLandVehicleProductionLocked();
                 _shipLaunchLandingRumbleActive = false;
                 _boostpackThrustActive = false;
@@ -890,7 +826,7 @@ void sds::HapticsManager::handleLandVehicleMotionState(
         {
             std::scoped_lock lock(_engineMutex);
             if (!_landVehicleProductionActive || !_landVehicleContextActive || _shipPilotActive ||
-                _shipBlockingMenuMask != 0 || !state.authorityActive || state.authorityEpoch == 0) {
+                _engine.gameplayBlocked() || !state.authorityActive || state.authorityEpoch == 0) {
                 _landVehicleMotion = {};
                 _landVehicleContinuous = {};
                 _landVehicleForwardBoostActive = false;
@@ -923,7 +859,7 @@ void sds::HapticsManager::handleLandVehicleMotionState(
                 if (diagnosticNow >= _nextLandVehicleDiagnosticLog) {
                     _nextLandVehicleDiagnosticLog = diagnosticNow + std::chrono::seconds(1);
                     const bool diagnosticBlocked = !_landVehicleProductionActive ||
-                        !_landVehicleContextActive || _shipPilotActive || _shipBlockingMenuMask != 0 ||
+                        !_landVehicleContextActive || _shipPilotActive || _engine.gameplayBlocked() ||
                         !state.authorityActive || state.authorityEpoch != _landVehicleProductionEpoch;
                     const bool diagnosticOwner = _landVehicleContinuous.kind == HapticContinuousKind::LandVehicleChassis &&
                         _landVehicleContinuous.gain > 0.0F;
@@ -983,7 +919,7 @@ bool sds::HapticsManager::setLandVehicleBoostInput(
                 if (!_landVehicleProductionActive ||
                     !_landVehicleContextActive ||
                     _shipPilotActive ||
-                    _shipBlockingMenuMask != 0 ||
+                    _engine.gameplayBlocked() ||
                     _landVehicleProductionEpoch == 0 ||
                     !_landVehicleMotion.authorityActive ||
                     _landVehicleMotion.authorityEpoch !=
@@ -1086,7 +1022,7 @@ bool sds::HapticsManager::handleShipPropulsionState(
         bool submitted = true;
         {
             std::scoped_lock lock(_engineMutex);
-            if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
+            if (_shipPilotActive && _shipContextSuppressed && !_engine.gameplayBlocked()) {
                 _shipPropulsionContinuous = mapShipPropulsionHaptics(state, 1.0F);
                 continuous = composeContinuousLocked();
                 submit = true;
@@ -1177,10 +1113,13 @@ bool sds::HapticsManager::handleRightTriggerInput(
         bool submitted = true;
         {
             std::scoped_lock lock(_engineMutex);
+            if (_engine.gameplayBlocked()) return true;
+            // A pre-marker release must not revoke the newer firing watchdog.
+            if (_cutterStartPending && r2 <= 12 && when < _cutterStartWhen) return true;
             _lastR2 = r2;
             _lastR2When = when;
             if (_shipContextSuppressed) {
-                if (_shipPilotActive && _shipLaserActive && r2 <= 12 && _shipBlockingMenuMask == 0) {
+                if (_shipPilotActive && _shipLaserActive && r2 <= 12 && !_engine.gameplayBlocked()) {
                     clearShipLaserLocked();
                     submitState = true;
                 } else {
@@ -1193,12 +1132,7 @@ bool sds::HapticsManager::handleRightTriggerInput(
                 }
                 {
                     if (_cutterStartPending) {
-                        if (when < _cutterStartWhen && r2 <= 12) {
-                            // This callback was sampled before the marker but waited
-                            // behind it on the manager lock. Ignore that stale release
-                            // and wait for the next genuinely post-marker R2 sample.
-                            submitState = false;
-                        } else if (when > _cutterStartDeadline) {
+                        if (when > _cutterStartDeadline) {
                             // Do not let an old start marker authorize a later pull.
                             _cutterStartPending = false;
                             _cutterStartWhen = {};
@@ -1238,9 +1172,7 @@ bool sds::HapticsManager::emitWeaponReloadCue(
         // post and successfully handed to the controller-speaker queue.
         const auto cue = weaponReloadHapticForAction(action);
         if (!cue || !_advancedHapticsEnabled.load(std::memory_order_acquire) ||
-            !_backend ||
-            _reloadPaused.load(std::memory_order_acquire) ||
-            _reloadBlockingMenus.load(std::memory_order_acquire) != 0u) {
+            !_backend || _engine.gameplayBlocked()) {
             return true;
         }
         if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
@@ -1334,7 +1266,8 @@ bool sds::HapticsManager::emitBoostpackIgnition(
         std::unique_lock lock(_engineMutex);
         std::optional<HapticCommand> command{};
         {
-            if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
+            if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive ||
+                _shipLaunchLandingRumbleActive || _engine.gameplayBlocked()) {
                 return true;
             }
 
@@ -1379,7 +1312,7 @@ bool sds::HapticsManager::emitOnFootLanding(
         if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
             return true;
         }
-        if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
+        if (_engine.gameplayBlocked() || _shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
             return true;
         }
         const float gain = std::clamp(
@@ -1408,7 +1341,8 @@ bool sds::HapticsManager::startBoostpackThrust() noexcept
     try {
         std::unique_lock lock(_engineMutex);
         {
-            if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
+            if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive ||
+                _shipLaunchLandingRumbleActive || _engine.gameplayBlocked()) {
                 _boostpackThrustActive = false;
                 return true;
             }

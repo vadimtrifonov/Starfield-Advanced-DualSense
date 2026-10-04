@@ -1723,6 +1723,35 @@ target("sds-v0361-ship-pilot-consumer-safety-tests", function()
         "src/core/WeaponSpeakerPlayback.cpp")
 end)
 
+target("sds-gameplay-feedback-lifecycle-tests", function()
+    set_kind("binary")
+    set_default(false)
+    add_includedirs("include")
+    add_files("tests/GameplayFeedbackLifecycleTest.cpp")
+    add_files(
+        "src/core/Config.cpp",
+        "src/core/WeaponProfiles.cpp",
+        "src/core/HapticsEngine.cpp",
+        "src/core/EffectsEngine.cpp",
+        "src/core/HapticWaveforms.cpp",
+        "src/core/HapticMixer.cpp",
+        "src/core/HapticEndpointSelection.cpp",
+        "src/core/HapticsManager.cpp",
+        "src/core/LandVehicleControllerFeel.cpp",
+        "src/core/ShipPropulsionHaptics.cpp",
+        "src/core/RuntimeEventRouter.cpp")
+    if is_plat("windows") then
+        add_defines("NOMINMAX", "WIN32_LEAN_AND_MEAN")
+        add_files(
+            "src/windows/DualSenseAudioTransport.cpp",
+            "src/core/MusicHapticsMixer.cpp",
+            "src/windows/DualSenseAudioHapticsClient.cpp",
+            "src/core/DualSenseAudioRenderBlock.cpp",
+            "src/core/SpeakerMixer.cpp")
+        add_syslinks("ole32", "uuid")
+    end
+end)
+
 target("sds-haptics-tests", function()
     set_kind("binary")
     set_default(false)

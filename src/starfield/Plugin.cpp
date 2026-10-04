@@ -37,6 +37,7 @@
 #include <StarfieldDualSense/FireMarkerBridge.h>
 #include <StarfieldDualSense/HidWriteTrace.h>
 #include <StarfieldDualSense/HapticsManager.h>
+#include <StarfieldDualSense/GameplayFeedbackGate.h>
 #include <StarfieldDualSense/HapticStrength.h>
 #include <StarfieldDualSense/MusicReconProbe.h>
 #include <StarfieldDualSense/RuntimeEventRouter.h>
@@ -2589,16 +2590,6 @@ if (connected && g_controller->bluetoothTransport()) {
         pluginLog(diagnostic.str());
     }
 
-    std::uint8_t boostpackProductionMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "MainMenu") return 0x01u;
-        if (menu == "DataMenu") return 0x02u;
-        if (menu == "PauseMenu") return 0x04u;
-        if (menu == "LoadingMenu") return 0x08u;
-        if (menu == "FaderMenu") return 0x10u;
-        return 0u;
-    }
-
     bool boostpackProductionCaptureArmed() noexcept
     {
         return g_boostpackFeedbackAuthority != nullptr &&
@@ -2668,7 +2659,7 @@ if (connected && g_controller->bluetoothTransport()) {
 
     void syncBoostpackProductionForMenu(std::string_view menu, bool opened) noexcept
     {
-        const auto bit = boostpackProductionMenuBit(menu);
+        const auto bit = sds::gameplayBlockingMenuBit(menu);
         if (bit == 0u) {
             return;
         }
@@ -2687,14 +2678,8 @@ if (connected && g_controller->bluetoothTransport()) {
     {
         std::uint8_t mask = 0u;
         if (auto* ui = RE::UI::GetSingleton()) {
-            const std::pair<std::string_view, std::uint8_t> menus[]{
-                { "MainMenu", 0x01u },
-                { "DataMenu", 0x02u },
-                { "PauseMenu", 0x04u },
-                { "LoadingMenu", 0x08u },
-                { "FaderMenu", 0x10u },
-            };
-            for (const auto& [name, bit] : menus) {
+            for (const auto name : sds::kGameplayBlockingMenus) {
+                const auto bit = sds::gameplayBlockingMenuBit(name);
                 if (ui->IsMenuOpen(RE::BSFixedString(name))) {
                     mask = static_cast<std::uint8_t>(mask | bit);
                 }

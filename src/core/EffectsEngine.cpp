@@ -84,36 +84,6 @@ namespace
         return { begin, length };
     }
 
-    std::uint8_t shipBlockingMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "DataMenu") {
-            return 0x1u;
-        }
-        if (menu == "PauseMenu") {
-            return 0x2u;
-        }
-        if (menu == "GalaxyStarMapMenu") {
-            return 0x8u;
-        }
-        return 0u;
-    }
-
-    std::uint8_t landVehicleBlockingMenuBit(std::string_view menu) noexcept
-    {
-        if (menu == "DataMenu") {
-            return 0x1u;
-        }
-        if (menu == "PauseMenu") {
-            return 0x2u;
-        }
-        if (menu == "LoadingMenu") {
-            return 0x4u;
-        }
-        if (menu == "GalaxyStarMapMenu") {
-            return 0x8u;
-        }
-        return 0u;
-    }
 }
 
 sds::EffectsEngine::EffectsEngine(Config config) noexcept :
@@ -626,10 +596,30 @@ void sds::EffectsEngine::clearLandVehicleProductionState() noexcept
     _state.transientUntil = {};
 }
 
+void sds::EffectsEngine::clearTransientTriggerState() noexcept
+{
+    _rightTriggerInput = 0;
+    _rightTriggerPressed = false;
+    _sustainedFireActive = false;
+    _sustainedHeartbeatDeadline = {};
+    _eonWallPhase = EonWallPhase::Normal;
+    _eonShotPullSeen = false;
+    _eonPendingUntil = {};
+    _shipLaserActive = false;
+    _shipLaserLeaseDeadline = {};
+    _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
+    _landVehicleAimActive = false;
+    _landVehicleGunRecoilDeadline = {};
+    _state.transientTriggerActive = false;
+    _state.transientUntil = {};
+    _state.output.leftTrigger = {};
+    _state.output.rightTrigger = {};
+}
+
 void sds::EffectsEngine::restorePersistentTrigger() noexcept
 {
     if (_shipLaunchLandingHapticsActive) {
-        if (_shipBlockingMenuMask != 0) {
+        if (_feedbackGate.shipTransitionBlocked()) {
             _state.output.leftTrigger = {};
             _state.output.rightTrigger = {};
         } else {
@@ -640,10 +630,12 @@ void sds::EffectsEngine::restorePersistentTrigger() noexcept
     }
 
     _state.output.leftTrigger = {};
+    if (_feedbackGate.blocked()) {
+        _state.output.rightTrigger = {};
+        return;
+    }
     if (_shipPilotActive) {
-        if (_shipBlockingMenuMask != 0) {
-            _state.output.rightTrigger = {};
-        } else if (_shipLaserActive) {
+        if (_shipLaserActive) {
             _state.output.rightTrigger = shipLaserFireTrigger();
         } else {
             _state.output.rightTrigger = _shipR2BallisticConfirmed ?
@@ -652,13 +644,8 @@ void sds::EffectsEngine::restorePersistentTrigger() noexcept
         return;
     }
     if (_landVehicleProductionActive && _landVehicleContextActive) {
-        if (_landVehicleBlockingMenuMask != 0) {
-            _state.output.leftTrigger = {};
-            _state.output.rightTrigger = {};
-        } else {
-            _state.output.leftTrigger = _landVehicleAimActive ? landVehicleAimTrigger() : TriggerEffect{};
-            _state.output.rightTrigger = landVehiclePrimaryFireWallTrigger();
-        }
+        _state.output.leftTrigger = _landVehicleAimActive ? landVehicleAimTrigger() : TriggerEffect{};
+        _state.output.rightTrigger = landVehiclePrimaryFireWallTrigger();
         return;
     }
     if (_persistentContextSuppressed || !_weaponEquipped) {
@@ -683,6 +670,10 @@ void sds::EffectsEngine::restorePersistentTrigger() noexcept
 
 sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 {
+    if (_feedbackGate.handle(event)) {
+        if (_feedbackGate.blocked()) clearTransientTriggerState();
+        restorePersistentTrigger();
+    }
     switch (event.type) {
     case GameEventType::PlayerHealthChanged:
         _playerHealthRatio = std::clamp(event.value, 0.0F, 1.0F);
@@ -749,7 +740,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
         break;
 
     case GameEventType::WeaponEquipped:
-        if (_persistentContextSuppressed) {
+        if (_persistentContextSuppressed || _shipLaunchLandingHapticsActive) {
             break;
         }
         _weaponEquipped = true;
@@ -769,7 +760,8 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
     case GameEventType::WeaponFired:
         // This event reaches the engine only from a confirmed Starfield
         // animation marker. R2 input alone never fabricates recoil.
-        if (onFootWeaponTriggersEnabled() && _weaponEquipped) {
+        if (onFootWeaponTriggersEnabled() && _weaponEquipped &&
+            !_feedbackGate.blocked() && !_shipLaunchLandingHapticsActive) {
             const auto markerText = eventIdentity(event);
             const bool sustainedEnergy = equippedTriggerFamily() == WeaponTriggerFamily::SustainedEnergy;
             const bool cutterHeartbeatWatchdog = _weaponProfile && _weaponProfile->name == "Cutter";
@@ -908,7 +900,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::ShipBallisticWeaponFired:
         if (_shipPilotActive && !_shipLaunchLandingHapticsActive &&
-            _shipBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+            !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
             _shipLaserActive = false;
             _shipLaserLeaseDeadline = {};
@@ -921,7 +913,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::ShipLaserWeaponFired:
         if (_shipPilotActive && !_shipLaunchLandingHapticsActive &&
-            _shipBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+            !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
             _shipR2BallisticConfirmed = false;
             _shipLaserActive = true;
@@ -942,7 +934,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::ShipParticleWeaponFired:
         if (_shipPilotActive && !_shipLaunchLandingHapticsActive &&
-            _shipBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+            !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
             _shipR2BallisticConfirmed = false;
             _shipLaserActive = false;
@@ -955,7 +947,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::ShipMissileWeaponFired:
         if (_shipPilotActive && !_shipLaunchLandingHapticsActive &&
-            _shipBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+            !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
             _shipR2BallisticConfirmed = false;
             _shipLaserActive = false;
@@ -968,7 +960,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::ShipEMWeaponFired:
         if (_shipPilotActive && !_shipLaunchLandingHapticsActive &&
-            _shipBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+            !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _shipR2BallisticConfirmed = false;
             _shipLaserActive = false;
             _shipLaserLeaseDeadline = {};
@@ -998,7 +990,6 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
     case GameEventType::ShipPilotEntered:
     case GameEventType::ShipPilotResumed:
         clearLandVehicleProductionState();
-        _landVehicleBlockingMenuMask = 0;
         _shipPilotActive = true;
         _shipLightbarSeatActive = true;
         _shipHealthValid = false;
@@ -1008,7 +999,6 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
         _shipR2BallisticConfirmed = false;
         _shipLaserActive = false;
         _shipLaserLeaseDeadline = {};
-        _shipBlockingMenuMask = 0;
         _shipEMTriggerRearmed = true;
         _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
         clearOnFootPersistentState();
@@ -1021,7 +1011,6 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
             _shipR2BallisticConfirmed = false;
             _shipLaserActive = false;
             _shipLaserLeaseDeadline = {};
-            _shipBlockingMenuMask = 0;
             _shipEMTriggerRearmed = true;
             _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
             clearOnFootPersistentState();
@@ -1035,7 +1024,6 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
                 _state.output.lightbar;
 
             clearLandVehicleProductionState();
-            _landVehicleBlockingMenuMask = 0;
             _landVehicleContextActive = true;
             _persistentContextSuppressed = true;
             clearOnFootPersistentState();
@@ -1054,7 +1042,6 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
                 _state.output.lightbar;
 
             clearLandVehicleProductionState();
-            _landVehicleBlockingMenuMask = 0;
             _landVehicleContextActive = false;
             clearOnFootPersistentState();
 
@@ -1088,7 +1075,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::LandVehicleAimStarted:
         if (_landVehicleProductionActive && _landVehicleContextActive &&
-            !_shipPilotActive && _landVehicleBlockingMenuMask == 0) {
+            !_shipPilotActive && !_feedbackGate.blocked()) {
             _landVehicleAimActive = true;
             _state.output.leftTrigger = landVehicleAimTrigger();
         }
@@ -1103,7 +1090,7 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::LandVehicleGunFired:
         if (_landVehicleProductionActive && _landVehicleContextActive && !_shipPilotActive &&
-            _landVehicleBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+            !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _state.output.rightTrigger = landVehicleGunFireTrigger();
             _landVehicleGunRecoilDeadline = event.when + std::chrono::milliseconds(70);
             _state.transientTriggerActive = true;
@@ -1113,14 +1100,12 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
 
     case GameEventType::ShipPilotInvalidated:
         clearLandVehicleProductionState();
-        _landVehicleBlockingMenuMask = 0;
         _shipPilotActive = false;
         _landVehicleContextActive = false;
         _shipLaunchLandingHapticsActive = false;
         _shipR2BallisticConfirmed = false;
         _shipLaserActive = false;
         _shipLaserLeaseDeadline = {};
-        _shipBlockingMenuMask = 0;
         _shipEMTriggerRearmed = true;
         _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
         _persistentContextSuppressed = true;
@@ -1142,54 +1127,20 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
             }
         }
 
-        const auto shipBit = shipBlockingMenuBit(identity);
-        if ((_shipPilotActive || _shipLaunchLandingHapticsActive) && shipBit != 0) {
-            _shipBlockingMenuMask = static_cast<std::uint8_t>(_shipBlockingMenuMask | shipBit);
-            _shipLaserActive = false;
-            _shipLaserLeaseDeadline = {};
-            _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
-            _state.output.leftTrigger = {};
-            _state.output.rightTrigger = {};
-            _state.transientTriggerActive = false;
-            _state.transientUntil = {};
+        if (identity == "MainMenu") {
+            _shipLaunchLandingHapticsActive = false;
+            restorePersistentTrigger();
         }
-
-        const auto vehicleBit = landVehicleBlockingMenuBit(identity);
-        if (_landVehicleContextActive && !_shipPilotActive && vehicleBit != 0) {
-            _landVehicleBlockingMenuMask = static_cast<std::uint8_t>(
-                _landVehicleBlockingMenuMask | vehicleBit);
-            _landVehicleAimActive = false;
-            _landVehicleGunRecoilDeadline = {};
-            _state.output.leftTrigger = {};
-            _state.output.rightTrigger = {};
-            _state.transientTriggerActive = false;
-            _state.transientUntil = {};
-            if (identity == "LoadingMenu") {
-                _landVehicleProductionActive = false;
-            }
+        if (identity == "LoadingMenu" && _landVehicleContextActive && !_shipPilotActive) {
+            _landVehicleProductionActive = false;
         }
         break;
     }
 
     case GameEventType::MenuClosed: {
         const auto identity = eventIdentity(event);
-        const auto shipBit = shipBlockingMenuBit(identity);
-        if ((_shipPilotActive || _shipLaunchLandingHapticsActive) && shipBit != 0) {
-            _shipBlockingMenuMask = static_cast<std::uint8_t>(_shipBlockingMenuMask & ~shipBit);
-            if (_shipBlockingMenuMask == 0) {
-                restorePersistentTrigger();
-            }
-        }
-
-        const auto vehicleBit = landVehicleBlockingMenuBit(identity);
-        if (_landVehicleContextActive && !_shipPilotActive && vehicleBit != 0) {
-            _landVehicleBlockingMenuMask = static_cast<std::uint8_t>(
-                _landVehicleBlockingMenuMask & ~vehicleBit);
-            if (_landVehicleProductionActive && _landVehicleBlockingMenuMask == 0) {
-                restorePersistentTrigger();
-            }
-        } else if (!_shipPilotActive && !_landVehicleContextActive &&
-                   _persistentContextSuppressed && identity == "LoadingMenu") {
+        if (!_shipPilotActive && !_landVehicleContextActive &&
+            _persistentContextSuppressed && identity == "LoadingMenu") {
             // Loading ending only releases the context gate. It does not
             // reconstruct any cached on-foot output; fresh gameplay events
             // must rebuild weapon and health ownership afterward.
@@ -1199,8 +1150,8 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
     }
 
     case GameEventType::Shutdown:
+        _feedbackGate = {};
         clearLandVehicleProductionState();
-        _landVehicleBlockingMenuMask = 0;
         _landVehicleProductionEpoch = 0;
         _shipPilotActive = false;
         _landVehicleContextActive = false;
@@ -1208,7 +1159,6 @@ sds::EffectState sds::EffectsEngine::handle(const GameEvent& event) noexcept
         _shipR2BallisticConfirmed = false;
         _shipLaserActive = false;
         _shipLaserLeaseDeadline = {};
-        _shipBlockingMenuMask = 0;
         _shipEMTriggerRearmed = true;
         _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::None;
         _persistentContextSuppressed = false;
@@ -1236,6 +1186,8 @@ sds::EffectState sds::EffectsEngine::handleRightTriggerInput(
     std::uint8_t value,
     std::chrono::steady_clock::time_point now) noexcept
 {
+    if (_feedbackGate.blocked() || _shipLaunchLandingHapticsActive) return _state;
+
     constexpr std::uint8_t kPressThreshold = 24;
     constexpr std::uint8_t kReleaseThreshold = 12;
 
@@ -1464,13 +1416,18 @@ sds::EffectState sds::EffectsEngine::tick(std::chrono::steady_clock::time_point 
         }
     }
 
+    if (_feedbackGate.blocked()) {
+        restorePersistentTrigger();
+        return _state;
+    }
+
     if (_shipEMTriggerRefreshPhase == ShipEMTriggerRefreshPhase::NeutralFrameQueued) {
         // Keep the trigger neutral for the remainder of this controller cycle.
         // ControllerManager applies outputs after tick(), so the next loop is
         // guaranteed to observe a real Off -> EffectEx transition.
         _shipEMTriggerRefreshPhase = ShipEMTriggerRefreshPhase::RetriggerReady;
     } else if (_shipEMTriggerRefreshPhase == ShipEMTriggerRefreshPhase::RetriggerReady) {
-        if (_shipPilotActive && _shipBlockingMenuMask == 0 && _config.adaptiveTriggers) {
+        if (_shipPilotActive && !_feedbackGate.blocked() && _config.adaptiveTriggers) {
             _state.output.rightTrigger = shipEMFireTrigger();
             _state.transientTriggerActive = true;
             _state.transientUntil = now + std::chrono::milliseconds(90);

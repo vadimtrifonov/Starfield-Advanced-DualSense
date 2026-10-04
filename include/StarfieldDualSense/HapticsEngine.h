@@ -2,6 +2,7 @@
 
 #include <StarfieldDualSense/Config.h>
 #include <StarfieldDualSense/HapticTypes.h>
+#include <StarfieldDualSense/GameplayFeedbackGate.h>
 #include <StarfieldDualSense/Types.h>
 #include <StarfieldDualSense/WeaponProfiles.h>
 
@@ -23,7 +24,12 @@ namespace sds
         [[nodiscard]] std::optional<HapticCommand> handle(const GameEvent& event) noexcept;
         [[nodiscard]] HapticContinuousState handleRightTriggerInput(std::uint8_t r2) noexcept;
 
+        [[nodiscard]] bool gameplayBlocked() const noexcept { return _feedbackGate.blocked(); }
+        [[nodiscard]] bool shipTransitionBlocked() const noexcept { return _feedbackGate.shipTransitionBlocked(); }
+
     private:
+        void clearWeaponFeedback() noexcept;
+        GameplayFeedbackGate _feedbackGate;
         float _hapticStrength{ 1.0F };
         Config _weaponHapticsConfig{};
         const WeaponProfile* _equipped{ nullptr };
@@ -35,7 +41,5 @@ namespace sds
         bool _magsniperChargeActive{ false };
         bool _novablastChargeAuthorized{ false };
         bool _autoRivetChargeAuthorized{ false };
-        bool _gamePaused{ false };
-        std::uint8_t _blockingMenuMask{ 0 };
     };
 }

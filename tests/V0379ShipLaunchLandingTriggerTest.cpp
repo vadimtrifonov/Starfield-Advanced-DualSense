@@ -131,5 +131,26 @@ int main()
           noAuthorityStopped.output.rightTrigger.mode == sds::TriggerEffectMode::Off,
         "landing sequence end releases both triggers when no cockpit authority is active");
 
+    for (auto menu : {"GalaxyStarMapMenu", "LoadingMenu", "MainMenu", "FaderMenu"}) {
+        sds::EffectsEngine transition(config);
+        (void)transition.handle(event(sds::GameEventType::ShipLaunchLandingHapticsStarted, t0));
+        (void)transition.handle(menuEvent(sds::GameEventType::MenuOpened, menu, t0 + 1s));
+        (void)transition.handleRightTriggerInput(255, t0 + 2s);
+        const auto during = transition.tick(t0 + 3s);
+        const bool fade = std::string_view(menu) == "FaderMenu";
+        check(during.output.leftTrigger == during.output.rightTrigger &&
+            (during.output.leftTrigger.mode == sds::TriggerEffectMode::EffectEx) == fade,
+            "only a fade preserves both transition triggers");
+        (void)transition.handle(event(sds::GameEventType::GamePaused, t0 + 4s));
+        (void)transition.handle(menuEvent(sds::GameEventType::MenuClosed, menu, t0 + 5s));
+        check(transition.state().output.leftTrigger.mode == sds::TriggerEffectMode::Off &&
+            transition.state().output.rightTrigger.mode == sds::TriggerEffectMode::Off,
+            "menu close cannot override a paused transition");
+        const auto resumed = transition.handle(event(sds::GameEventType::GameUnpaused, t0 + 6s));
+        const bool ended = std::string_view(menu) == "MainMenu";
+        check((resumed.output.leftTrigger.mode == sds::TriggerEffectMode::EffectEx) != ended,
+            "MainMenu discards transition authority rather than resuming it");
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

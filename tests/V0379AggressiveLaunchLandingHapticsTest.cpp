@@ -149,6 +149,25 @@ int main()
     check(backend->continuous == sds::HapticContinuousState{},
         "cancelled landing leaves no stuck continuous haptic state");
 
+    for (const auto menu : {"FaderMenu", "PauseMenu"}) {
+        check(manager.setShipLaunchLandingRumble(true, "landing"), "landing feedback starts");
+        check(manager.handle(menuEvent(sds::GameEventType::MenuOpened, menu, t0 + 3s)),
+            "transition menu opens");
+        const auto beforeTouchdown = backend->commands.size();
+        check(manager.handle(event(sds::GameEventType::ShipTouchdown, t0 + 4s)),
+            "touchdown is consumed inside transition menu");
+        const bool fade = std::string_view(menu) == "FaderMenu";
+        check(backend->continuous == sds::HapticContinuousState{} &&
+            backend->commands.size() == beforeTouchdown + (fade ? 1u : 0u),
+            "touchdown stops rumble and preserves its impact during a fade, but not pause");
+        if (fade) check(backend->commands.back().kind == sds::HapticEffectKind::ShipTouchdownThump &&
+            std::abs(backend->commands.back().gain - 0.90F) < 0.01F, "fade does not retune touchdown");
+        check(manager.handle(menuEvent(sds::GameEventType::MenuClosed, menu, t0 + 5s)),
+            "transition menu closes");
+        check(backend->continuous == sds::HapticContinuousState{},
+            "menu close cannot restart a completed landing");
+    }
+
     bool takeoffLog = false;
     bool landingLog = false;
     bool stopLog = false;
