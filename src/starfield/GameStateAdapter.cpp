@@ -1376,12 +1376,12 @@ bool sds::GameStateAdapter::registerSinks()
 
     equipSource->RegisterSink(this);
     ui->RegisterSink<RE::MenuOpenCloseEvent>(this);
-
-    _mainMenuOpen.store(
+    _worldGate.snapshot(
         ui->IsMenuOpen(RE::BSFixedString("MainMenu")),
-        std::memory_order_release);
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
-        log("Game state: MainMenu safety gate ACTIVE at sink registration; gameplay world polling suspended");
+        ui->IsMenuOpen(RE::BSFixedString("LoadingMenu")));
+
+    if (!worldAvailable()) {
+        log("Game state: world access suspended at sink registration");
     }
 
     _registered = true;
@@ -1410,6 +1410,7 @@ bool sds::GameStateAdapter::registerSinks()
 
 void sds::GameStateAdapter::unregisterSinks() noexcept
 {
+    _worldGate.suspend();
     auto* expectedObserver = this;
     (void)g_semanticDiagnosticObserver.compare_exchange_strong(
         expectedObserver,
@@ -3937,7 +3938,7 @@ bool sds::GameStateAdapter::dispatchNativeInputFrame(
 
 void sds::GameStateAdapter::refreshFireMarkerSinks() noexcept
 {
-    if (!_registered || !_fireMarkerTraceEnabled) {
+    if (!worldAvailable() || !_registered || !_fireMarkerTraceEnabled) {
         return;
     }
 
@@ -3947,6 +3948,10 @@ void sds::GameStateAdapter::refreshFireMarkerSinks() noexcept
     }
 
     try {
+        std::unique_lock sourceGuard(_fireMarkerGraphMutex);
+        if (!worldAvailable()) {
+            return;
+        }
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) {
             return;
@@ -3983,8 +3988,6 @@ void sds::GameStateAdapter::refreshFireMarkerSinks() noexcept
         std::size_t removed = 0;
         std::size_t total = 0;
         {
-            std::scoped_lock sourceGuard(_fireMarkerGraphMutex);
-
             for (std::size_t i = 0; i < _fireMarkerSourceCount; ++i) {
                 auto* oldGraph = _fireMarkerGraphs[i].get();
                 const auto stillCurrent = std::find_if(
@@ -4032,6 +4035,7 @@ void sds::GameStateAdapter::refreshFireMarkerSinks() noexcept
             }
             total = _fireMarkerSourceCount;
         }
+        sourceGuard.unlock();
 
         if (newlyRegistered != 0 || removed != 0) {
             char message[192]{};
@@ -4620,6 +4624,9 @@ void sds::GameStateAdapter::runTESHitSourceDiscovery(
 std::optional<float> sds::GameStateAdapter::readPlayerHealthRatio(
     RE::PlayerCharacter* player) const noexcept
 {
+    if (!worldAvailable()) {
+        return std::nullopt;
+    }
     auto* actorValues = RE::ActorValue::GetSingleton();
     if (!player || !actorValues || !actorValues->health) {
         return std::nullopt;
@@ -4703,7 +4710,7 @@ void sds::GameStateAdapter::drainIncomingDamageCorrelations(
 
 std::optional<sds::ShipLandingReconStateObservation> sds::GameStateAdapter::pollShipLandingReconStatePrecision()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return std::nullopt;
     }
     auto* player = RE::PlayerCharacter::GetSingleton();
@@ -4743,7 +4750,7 @@ std::optional<sds::ShipLandingReconStateObservation> sds::GameStateAdapter::poll
 
 std::optional<sds::ShipPropulsionState> sds::GameStateAdapter::pollShipLandingReconState()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return std::nullopt;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -4785,7 +4792,7 @@ std::optional<sds::ShipPropulsionState> sds::GameStateAdapter::pollShipLandingRe
 
 std::optional<sds::LandVehicleReconResult> sds::GameStateAdapter::pollLandVehicleReconState()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return std::nullopt;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -5128,7 +5135,7 @@ bool sds::GameStateAdapter::armLandVehicleVerticalBoost() noexcept
 
 void sds::GameStateAdapter::pollShipLightbarSeatAuthority()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return;
     }
 
@@ -5270,7 +5277,7 @@ void sds::GameStateAdapter::pollShipLightbarSeatAuthority()
 }
 std::optional<sds::ShipPropulsionState> sds::GameStateAdapter::pollShipPropulsionState()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return std::nullopt;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -5436,7 +5443,7 @@ std::optional<sds::ShipPropulsionState> sds::GameStateAdapter::pollShipPropulsio
 
 bool sds::GameStateAdapter::refreshPlayerHealth()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return false;
     }
     auto* player = RE::PlayerCharacter::GetSingleton();
@@ -5464,7 +5471,7 @@ bool sds::GameStateAdapter::refreshPlayerHealth()
 
 void sds::GameStateAdapter::pollHealth()
 {
-    if (_mainMenuOpen.load(std::memory_order_acquire)) {
+    if (!worldAvailable()) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -5603,6 +5610,9 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
     const RE::ActorItemEquipped::Event& event,
     RE::BSTEventSource<RE::ActorItemEquipped::Event>*)
 {
+    if (!worldAvailable()) {
+        return RE::BSEventNotifyControl::kContinue;
+    }
     auto* player = RE::PlayerCharacter::GetSingleton();
     if (!player || event.actor.get() != player || !event.item ||
         event.item->GetFormType() != RE::FormType::kWEAP) {
@@ -5680,7 +5690,7 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
     RE::BSTEventSource<RE::BSAnimationGraphEvent>* source)
 {
     try {
-        if (!_fireMarkerTraceEnabled) {
+        if (!worldAvailable() || !_fireMarkerTraceEnabled) {
             return RE::BSEventNotifyControl::kContinue;
         }
 
@@ -5765,6 +5775,9 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
     const RE::TESHitEvent& event,
     RE::BSTEventSource<RE::TESHitEvent>* source)
 {
+    if (!worldAvailable()) {
+        return RE::BSEventNotifyControl::kContinue;
+    }
     const auto now = std::chrono::steady_clock::now();
     bool meleeContextActive = false;
     std::uint64_t sequence = 0;
@@ -6092,6 +6105,9 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
         sequence = ++_landVehicleDriverEventSequence;
         _landVehicleLastDriverEventAt = now;
     }
+    if (!worldAvailable()) {
+        return RE::BSEventNotifyControl::kContinue;
+    }
 
     bool cameraVehicle = false;
     try {
@@ -6162,46 +6178,51 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
     normalized.when = std::chrono::steady_clock::now();
     const char* name = event.menuName.c_str();
 
-    if (name && std::strcmp(name, "MainMenu") == 0) {
-        const bool wasOpen = _mainMenuOpen.exchange(
-            event.opening,
-            std::memory_order_acq_rel);
-
-        if (event.opening && !wasOpen) {
+    ShipPilotTransition shipTransition = ShipPilotTransition::None;
+    if (name) {
+        copyText(normalized, name);
+        _worldGate.observeMenu(name, event.opening);
+        const bool mainMenu = std::strcmp(name, "MainMenu") == 0;
+        const bool loadingMenu = std::strcmp(name, "LoadingMenu") == 0;
+        if (event.opening && (mainMenu || loadingMenu)) {
             _shipPropulsionProbe.reset();
-            _nextShipPropulsionPoll = {};
-            _nextLandVehicleReconPoll = {};
+            _fireMarkerCapture.disarm();
+            clearFireMarkerSinks();
+            unregisterTargetHitSink();
+            unregisterTESHitSink();
+            _tesHitSessionDiscoveryAttempted = false;
             _lastHealthRatio = -1.0F;
-
             {
                 std::scoped_lock healthGuard(_incomingDamageMutex);
+                _incomingDamageDiagnostic = {};
                 _incomingDamageNullTargetFallback.clear();
+                _lastIncomingDamageDropCountLogged = 0;
                 _lastPeriodicHealthAvailable = false;
                 _lastPeriodicHealthRatio = 0.0F;
                 _lastPeriodicHealthSampleAt = {};
             }
-
-            log("Game state: MainMenu safety gate ACTIVE; gameplay world polling suspended");
-        } else if (!event.opening && wasOpen) {
-            const auto now = std::chrono::steady_clock::now();
-            _nextHealthPoll = now;
-            _nextLandVehicleReconPoll = now;
-            _nextShipPropulsionPoll = {};
-            log("Game state: MainMenu safety gate RELEASED; gameplay world polling resumed");
+            log("Game state: world access suspended; player graph sinks and world evidence cleared");
         }
-    }
-
-    ShipPilotTransition shipTransition = ShipPilotTransition::None;
-    if (name) {
-        copyText(normalized, name);
-        shipTransition = _shipPilotContext.observeMenu(name, event.opening);
+        if (mainMenu || loadingMenu) {
+            _nextHealthPoll = normalized.when;
+            _nextLandVehicleReconPoll = normalized.when;
+            _nextShipPropulsionPoll = {};
+        }
+        if (mainMenu && event.opening) {
+            shipTransition = _shipPilotContext.piloting() ? ShipPilotTransition::Invalidated : ShipPilotTransition::None;
+            _shipPilotContext.reset();
+        } else {
+            shipTransition = _shipPilotContext.observeMenu(name, event.opening);
+        }
         if (std::strcmp(name, "MonocleMenu") == 0) {
             _monocleOpen = event.opening;
         }
-        if (std::strcmp(name, "LoadingMenu") == 0) {
+        if (loadingMenu || (mainMenu && event.opening)) {
             {
                 std::scoped_lock landVehicleGuard(_landVehicleReconMutex);
-                _landVehicleLoading = event.opening;
+                if (loadingMenu) {
+                    _landVehicleLoading = event.opening;
+                }
                 if (event.opening) {
                     (void)_landVehicleReconProbe.invalidateForLoading(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(normalized.when.time_since_epoch()).count()));
                     _landVehicleTelemetryProbe.reset();
@@ -6215,7 +6236,7 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
             }
             if (event.opening) {
                 clearLandVehicleProductionState(normalized.when, true);
-                log("Land vehicle recon: INVALIDATE source=LoadingMenu freshEvidenceRequired=yes controllerOutput=none");
+                log("Land vehicle recon: INVALIDATE source=world-teardown freshEvidenceRequired=yes controllerOutput=none");
             } else {
                 log("Land vehicle recon: LoadingMenu closed freshEvidenceRequired=yes controllerOutput=none");
             }
@@ -6269,7 +6290,7 @@ RE::BSEventNotifyControl sds::GameStateAdapter::ProcessEvent(
         break;
     case ShipPilotTransition::Invalidated:
         shipEvent.type = GameEventType::ShipPilotInvalidated;
-        copyText(shipEvent, "LoadingMenu");
+        copyText(shipEvent, name ? name : "LoadingMenu");
         emit(shipEvent);
         break;
     case ShipPilotTransition::Resumed:

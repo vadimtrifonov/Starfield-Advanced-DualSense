@@ -2036,7 +2036,7 @@ if (connected && g_controller->bluetoothTransport()) {
 
     void maybeStartShipTakeoffRumble(bool pilotActive, bool precisionTouchdownPoll) noexcept
     {
-        if (!pilotActive || precisionTouchdownPoll ||
+        if (!g_gameState || !g_gameState->worldAvailable() || !pilotActive || precisionTouchdownPoll ||
             g_shipLaunchLandingRumblePhase.load(std::memory_order_acquire) != ShipLaunchLandingRumblePhase::None ||
             !g_lastShipStateValid.load(std::memory_order_acquire) ||
             !g_lastShipLanded.load(std::memory_order_acquire) ||
@@ -2524,7 +2524,7 @@ if (connected && g_controller->bluetoothTransport()) {
 
     bool refreshCurrentEquippedWeaponState(std::uint32_t* refreshedFormId = nullptr) noexcept
     {
-        if (g_runtimeShutdown || !g_gameState || !g_fireMarkerBridge) {
+        if (g_runtimeShutdown || !g_gameState || !g_gameState->worldAvailable() || !g_fireMarkerBridge) {
             return false;
         }
 
@@ -2561,7 +2561,8 @@ if (connected && g_controller->bluetoothTransport()) {
 
     void bootstrapStartupEquippedWeaponIfReady() noexcept
     {
-        if (g_startupWeaponBootstrapComplete.load(std::memory_order_acquire) || g_runtimeShutdown || !g_gameState || !g_fireMarkerBridge) {
+        if (g_startupWeaponBootstrapComplete.load(std::memory_order_acquire) || g_runtimeShutdown ||
+            !g_gameState || !g_gameState->worldAvailable() || !g_fireMarkerBridge) {
             return;
         }
 
@@ -4788,7 +4789,8 @@ if (connected && g_controller->bluetoothTransport()) {
 
 
 
-        if (!g_shipPilotActive.load(std::memory_order_acquire) &&
+        if (g_gameState && g_gameState->worldAvailable() &&
+            !g_shipPilotActive.load(std::memory_order_acquire) &&
             g_onFootRefreshPending.load(std::memory_order_acquire)) {
             bool loadingMenuOpen = false;
             if (auto* ui = RE::UI::GetSingleton()) {
@@ -5828,17 +5830,17 @@ if (connected && g_controller->bluetoothTransport()) {
                 }
                 const auto menu = std::string_view(event.text.data());
                 if (event.type == sds::GameEventType::MenuOpened &&
-                    menu == "LoadingMenu" &&
+                    (menu == "MainMenu" || menu == "LoadingMenu") &&
                     g_startupWeaponBootstrapComplete.exchange(
                         false,
                         std::memory_order_acq_rel)) {
 
                     pluginLog(
-                        "Game state: equipped weapon bootstrap rearmed reason=LoadingMenu-open");
+                        "Game state: equipped weapon bootstrap rearmed for world teardown");
                 }
 
                 if (event.type == sds::GameEventType::MenuOpened &&
-                    menu == "LoadingMenu" &&
+                    (menu == "MainMenu" || menu == "LoadingMenu") &&
                     g_fireMarkerBridge) {
 
                     g_fireMarkerBridge->suspendPlayerGraphsForWorldTeardown();
@@ -5969,7 +5971,8 @@ if (connected && g_controller->bluetoothTransport()) {
                 g_shipLaunchLandingReconProbe.setPilotActive(false);
                 g_onFootRefreshPending.store(false, std::memory_order_release);
                 g_autoRivetChargeCaptureArmed.store(false, std::memory_order_release);
-                pluginLog("Ship pilot context: INVALIDATE source=LoadingMenu refresh=deferred-until-fresh-context");
+                pluginLog(std::string("Ship pilot context: INVALIDATE source=") + event.text.data() +
+                    " refresh=deferred-until-fresh-context");
                 break;
 
             case sds::GameEventType::ShipPilotResumed:
@@ -6170,6 +6173,7 @@ if (connected && g_controller->bluetoothTransport()) {
 
         g_fireMarkerBridge = std::make_unique<sds::FireMarkerBridge>(
             runtimeEmit,
+            [] { return g_gameState && g_gameState->worldAvailable(); },
             nativeLog,
             config.debugLogging,
             std::move(animationMarkerObserver));

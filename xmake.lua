@@ -1769,6 +1769,14 @@ if is_plat("windows") then
         add_files("tests/OverlappedIoTest.cpp")
     end)
 
+    target("sds-world-lifecycle-tests", function()
+        set_kind("binary")
+        set_default(false)
+        add_includedirs("tests/world-stubs", "include")
+        add_defines("NOMINMAX", "WIN32_LEAN_AND_MEAN")
+        add_files("tests/WorldLifecycleTest.cpp", "src/core/WeaponProfiles.cpp")
+    end)
+
     target("sds-hid-owner-probe", function()
         set_kind("binary")
         set_default(false)

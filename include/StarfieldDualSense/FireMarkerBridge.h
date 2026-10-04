@@ -36,6 +36,7 @@ namespace sds
     {
     public:
         using EmitCallback = std::function<bool(GameEvent)>;
+        using WorldAvailableCallback = std::function<bool()>;
         using LogCallback = std::function<void(std::string_view)>;
         using AnimationMarkerObserver = std::function<bool(
             std::string_view,
@@ -44,10 +45,12 @@ namespace sds
 
         FireMarkerBridge(
             EmitCallback emit,
+            WorldAvailableCallback worldAvailable,
             LogCallback log = {},
             bool debugLogging = false,
             AnimationMarkerObserver animationMarkerObserver = {}) :
             _emit(std::move(emit)),
+            _worldAvailable(std::move(worldAvailable)),
             _log(std::move(log)),
             _debugLogging(debugLogging),
             _animationMarkerObserver(std::move(animationMarkerObserver))
@@ -110,18 +113,10 @@ namespace sds
         {
             try {
                 std::scoped_lock lock(_mutex);
-                const auto graphCount = _graphs.size();
                 unregisterPlayerGraphsLocked();
-
-                char buffer[192]{};
-                std::snprintf(
-                    buffer,
-                    sizeof(buffer),
-                    "Fire marker bridge: player graph sinks DETACHED reason=LoadingMenu-open graphs=%zu",
-                    graphCount);
-                log(buffer);
+                log("Fire marker bridge: player graph sinks detached for world teardown");
             } catch (...) {
-                log("Fire marker bridge: player graph detach exception ignored reason=LoadingMenu-open");
+                log("Fire marker bridge: player graph detach failed during world teardown");
             }
         }
 
@@ -129,13 +124,16 @@ namespace sds
             const RE::ActorItemEquipped::Event& event,
             RE::BSTEventSource<RE::ActorItemEquipped::Event>*) override
         {
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!player || event.actor.get() != player || !event.item ||
-                event.item->GetFormType() != RE::FormType::kWEAP) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-
             try {
+                std::scoped_lock lock(_mutex);
+                if (!_started || !_worldAvailable || !_worldAvailable()) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (!player || event.actor.get() != player || !event.item ||
+                    event.item->GetFormType() != RE::FormType::kWEAP) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
                 const auto identity = weaponIdentity(event.item);
                 const auto* profile = findWeaponProfile(identity);
                 const auto triggerFamily = profile ? profile->triggerFamily : WeaponTriggerFamily::BallisticRifle;
@@ -144,7 +142,6 @@ namespace sds
                 const bool novablastChargeMarker =
                     profile && profile->name == "Novablast Disruptor";
 
-                std::scoped_lock lock(_mutex);
                 const auto graphCount = reconcilePlayerGraphsLocked(player);
                 _triggerFamily.store(triggerFamily, std::memory_order_release);
                 _weaponArmed.store(graphCount != 0, std::memory_order_release);
@@ -197,7 +194,8 @@ namespace sds
             const RE::BSAnimationGraphEvent& graphEvent,
             RE::BSTEventSource<RE::BSAnimationGraphEvent>* source) override
         {
-            if (!_weaponArmed.load(std::memory_order_acquire) || !sourceMatchesRegisteredPlayerGraph(source)) {
+            if (!_worldAvailable || !_worldAvailable() ||
+                !_weaponArmed.load(std::memory_order_acquire) || !sourceMatchesRegisteredPlayerGraph(source)) {
                 return RE::BSEventNotifyControl::kContinue;
             }
 
@@ -533,6 +531,7 @@ namespace sds
         }
 
         EmitCallback _emit{};
+        WorldAvailableCallback _worldAvailable{};
         LogCallback _log{};
         bool _debugLogging{ false };
         AnimationMarkerObserver _animationMarkerObserver{};

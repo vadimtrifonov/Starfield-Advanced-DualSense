@@ -1,6 +1,7 @@
 #pragma once
 
 #include <StarfieldDualSense/Types.h>
+#include <StarfieldDualSense/GameWorldGate.h>
 #include <StarfieldDualSense/FireMarkerTrace.h>
 #include <StarfieldDualSense/InputDiagnostics.h>
 #include <StarfieldDualSense/IncomingDamageDiagnostic.h>
@@ -91,6 +92,7 @@ namespace sds
 
         bool registerSinks();
         void unregisterSinks() noexcept;
+        [[nodiscard]] bool worldAvailable() const noexcept { return _worldGate.available(); }
         void pollHealth();
         [[nodiscard]] bool refreshPlayerHealth();
         void pollShipLightbarSeatAuthority();
@@ -104,7 +106,7 @@ namespace sds
         void setLandVehicleMotionCallback(LandVehicleMotionCallback callback);
         void setLandVehicleSemanticCallback(LandVehicleSemanticCallback callback);
         [[nodiscard]] bool landVehicleReconCorrelationArmed() const noexcept { return _landVehicleCorrelationArmed.load(std::memory_order_acquire); }
-        [[nodiscard]] bool mainMenuOpen() const noexcept { return _mainMenuOpen.load(std::memory_order_acquire); }
+        [[nodiscard]] bool mainMenuOpen() const noexcept { return _worldGate.mainMenuOpen(); }
         [[nodiscard]] bool queueNativeInputAction(InputAction action) noexcept;
         void pollNativeInputInjection() noexcept;
         void dispatchBluetoothPhysicalInput(
@@ -181,7 +183,7 @@ namespace sds
         bool _incomingDamageDiagnosticEnabled{ false };
         bool _tesHitSessionDiscoveryAttempted{ false };
         bool _registered{ false };
-        std::atomic_bool _mainMenuOpen{ false };
+        GameWorldGate _worldGate{};
         static constexpr std::size_t kMaxFireMarkerSources = 8;
         std::mutex _fireMarkerGraphMutex{};
         std::array<RE::BSTSmartPointer<RE::BSAnimationGraph>, kMaxFireMarkerSources> _fireMarkerGraphs{};
