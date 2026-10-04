@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -38,6 +40,9 @@ namespace
         std::atomic<int> continuousSets{ 0 };
         std::mutex mutex{};
         sds::HapticContinuousState continuous{};
+        std::function<void()> beforePublish;
+        std::function<void()> beforeEnqueue;
+        std::atomic_bool enqueuedAfterStop{ false };
     };
 
     class Backend final : public sds::IHapticsBackend
@@ -46,9 +51,16 @@ namespace
         explicit Backend(std::shared_ptr<State> state) : _state(std::move(state)) {}
         void start() override { _state->active = true; }
         void stop() noexcept override { _state->active = false; }
-        bool enqueue(sds::HapticCommand) noexcept override { return true; }
+        bool enqueue(sds::HapticCommand) noexcept override
+        {
+            const auto state = _state;
+            if (state->beforeEnqueue) state->beforeEnqueue();
+            state->enqueuedAfterStop = !state->active.load();
+            return true;
+        }
         bool setContinuous(sds::HapticContinuousState continuous) noexcept override
         {
+            if (_state->beforePublish) _state->beforePublish();
             {
                 std::scoped_lock lock(_state->mutex);
                 _state->continuous = continuous;
@@ -182,8 +194,70 @@ int main()
     require(continuous(backendState).kind == sds::HapticContinuousKind::None,
         "post-exit ship samples cannot reacquire haptic ownership");
 
+    // Stall an older publication at the backend, not at a diagnostic log statement.
+    require(manager.handle(event(sds::GameEventType::ShipPilotEntered)), "ordering fixture enters ship");
+    std::promise<void> entered, release, pauseStarted;
+    auto enteredFuture = entered.get_future();
+    auto released = release.get_future().share();
+    std::atomic_bool holdNext{true};
+    backendState->beforePublish = [&] {
+        if (holdNext.exchange(false)) {
+            entered.set_value();
+            require(released.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "stalled publication released");
+        }
+    };
+    auto older = std::async(std::launch::async, [&] { return manager.handleShipPropulsionState(boostState()); });
+    require(enteredFuture.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+        "older propulsion publication entered backend");
+    auto pause = std::async(std::launch::async, [&] {
+        pauseStarted.set_value();
+        return manager.handle(event(sds::GameEventType::MenuOpened, "PauseMenu"));
+    });
+    require(pauseStarted.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+        "newer menu stop started");
+    const bool overtook = pause.wait_for(std::chrono::milliseconds(25)) == std::future_status::ready;
+    release.set_value();
+    require(older.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
+        pause.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+        "both publications complete");
+    require(older.get() && pause.get(), "ordered submissions succeed");
+    backendState->beforePublish = {};
+    require(!overtook && continuous(backendState).kind == sds::HapticContinuousKind::None,
+        "an older update cannot overwrite a newer menu stop");
+
     manager.stop();
     require(continuous(backendState).kind == sds::HapticContinuousKind::None,
         "shutdown leaves propulsion haptics at exact neutral");
+    for (bool reload : {false, true}) {
+        auto state = std::make_shared<State>();
+        sds::HapticsManager finite(config, [state] { return std::make_unique<Backend>(state); });
+        finite.start();
+        require(finite.handle(event(sds::GameEventType::WeaponEquipped, "Eon")), "finite cue fixture equips Eon");
+        std::promise<void> enqueuing, finishEnqueue, stopStarted;
+        auto waiting = enqueuing.get_future();
+        auto finish = finishEnqueue.get_future().share();
+        state->beforeEnqueue = [&] {
+            enqueuing.set_value();
+            require(finish.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                "finite cue submission released");
+        };
+        auto submit = std::async(std::launch::async, [&] {
+            return reload ? finite.emitWeaponReloadCue("mag-in") : finite.emitOnFootLanding(0.5F);
+        });
+        require(waiting.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "finite cue reached backend");
+        auto stopping = std::async(std::launch::async, [&] { stopStarted.set_value(); finite.stop(); });
+        require(stopStarted.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+            "concurrent backend stop started");
+        const bool stoppedEarly = stopping.wait_for(std::chrono::milliseconds(25)) == std::future_status::ready;
+        finishEnqueue.set_value();
+        require(submit.wait_for(std::chrono::seconds(5)) == std::future_status::ready &&
+            stopping.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "finite submission and stop complete");
+        require(submit.get(), "finite cue submission succeeds");
+        stopping.get();
+        require(!stoppedEarly && !state->enqueuedAfterStop,
+            reload ? "reload cue retains backend through submission" : "landing cue retains backend through submission");
+    }
     return EXIT_SUCCESS;
 }

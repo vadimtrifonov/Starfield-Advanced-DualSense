@@ -92,6 +92,7 @@ sds::HapticsManager::~HapticsManager()
 
 void sds::HapticsManager::start()
 {
+    std::scoped_lock lock(_engineMutex);
     if (_started) {
         return;
     }
@@ -124,6 +125,7 @@ void sds::HapticsManager::applyLiveSettings(
     GameplayHapticsLiveSettings settings) noexcept
 {
     try {
+        std::unique_lock lock(_engineMutex);
         settings.hapticStrength =
             sds::clampHapticStrengthSetting(settings.hapticStrength);
         settings.boostpackHapticsStrength =
@@ -148,14 +150,9 @@ void sds::HapticsManager::applyLiveSettings(
             _hapticStrength.exchange(effectiveStrength, std::memory_order_acq_rel);
         const bool strengthChanged = previousStrength != effectiveStrength;
 
-        bool weaponSettingsChanged = false;
-        {
-            std::scoped_lock lock(_engineMutex);
-            _engine.setHapticStrength(settings.hapticStrength);
-            weaponSettingsChanged =
-                _engine.setWeaponHapticsConfig(
-                    settings.weaponHapticsConfig);
-        }
+        _engine.setHapticStrength(settings.hapticStrength);
+        const bool weaponSettingsChanged =
+            _engine.setWeaponHapticsConfig(settings.weaponHapticsConfig);
 
         if (!settings.advancedHaptics) {
             _advancedHapticsEnabled.store(false, std::memory_order_release);
@@ -184,21 +181,7 @@ void sds::HapticsManager::applyLiveSettings(
             return;
         }
 
-        HapticContinuousState continuous{};
-        {
-            std::scoped_lock lock(_engineMutex);
-            if (_shipPilotActive || _shipLaunchLandingRumbleActive) {
-                continuous = composeShipContinuousLocked();
-            } else if (_landVehicleProductionActive &&
-                       _landVehicleContextActive &&
-                       !_shipPilotActive) {
-                continuous = composeLandVehicleContinuousLocked();
-            } else {
-                continuous = composeOnFootContinuousLocked();
-            }
-        }
-
-        (void)_backend->setContinuous(continuous);
+        (void)submitContinuousLocked();
     } catch (...) {
         if (settings.advancedHaptics) {
             _advancedHapticsEnabled.store(false, std::memory_order_release);
@@ -225,6 +208,29 @@ void sds::HapticsManager::clearOnFootContextStateLocked() noexcept
 }
 
 
+sds::HapticContinuousState sds::HapticsManager::composeContinuousLocked() noexcept
+{
+    if (_shipPilotActive || _shipLaunchLandingRumbleActive) {
+        return composeShipContinuousLocked();
+    }
+    if (_landVehicleContextActive) {
+        return composeLandVehicleContinuousLocked();
+    }
+    if (_shipContextSuppressed) {
+        return {};
+    }
+    return composeOnFootContinuousLocked();
+}
+
+bool sds::HapticsManager::submitContinuousLocked() noexcept
+{
+    // State changes, publication and backend teardown share the same lock.
+    if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
+        return true;
+    }
+    return _backend->setContinuous(composeContinuousLocked());
+}
+
 sds::HapticContinuousState sds::HapticsManager::composeOnFootContinuousLocked() noexcept
 {
     if (_boostpackThrustActive &&
@@ -243,7 +249,7 @@ sds::HapticContinuousState sds::HapticsManager::composeOnFootContinuousLocked() 
         }
     }
 
-    return _engine.handleRightTriggerInput(_lastR2);
+    return _cutterStartPending ? HapticContinuousState{} : _engine.handleRightTriggerInput(_lastR2);
 }
 sds::HapticContinuousState sds::HapticsManager::composeShipContinuousLocked() const noexcept
 {
@@ -355,6 +361,7 @@ void sds::HapticsManager::clearShipLaserLocked() noexcept
 
 void sds::HapticsManager::stop() noexcept
 {
+    std::scoped_lock lock(_engineMutex);
     if (_backend) {
         try {
             (void)_backend->setContinuous({});
@@ -365,7 +372,6 @@ void sds::HapticsManager::stop() noexcept
         _backend.reset();
     }
     {
-        std::scoped_lock lock(_engineMutex);
         _shipPilotActive = false;
         _landVehicleContextActive = false;
         _shipContextSuppressed = false;
@@ -385,6 +391,9 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
         std::optional<HapticCommand> command;
         std::optional<HapticContinuousState> continuous;
         bool contextHandled = false;
+        bool ok = true;
+        bool continuousSubmitted = false;
+        bool crestSubmitted = false;
         {
             std::scoped_lock lock(_engineMutex);
             const auto type = event.type;
@@ -696,9 +705,22 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
                 _shipContextSuppressed = false;
                 _shipBlockingMenuMask = 0;
                 clearLandVehicleProductionLocked();
+                _shipLaunchLandingRumbleActive = false;
+                _boostpackThrustActive = false;
                 continuous = HapticContinuousState{};
                 _lastR2 = 0;
                 _lastR2When = {};
+            }
+            if (_advancedHapticsEnabled.load(std::memory_order_acquire) && _backend) {
+                if (continuous) {
+                    continuous = composeContinuousLocked();
+                    continuousSubmitted = _backend->setContinuous(*continuous);
+                    ok = continuousSubmitted;
+                }
+                if (command) {
+                    crestSubmitted = _backend->enqueue(*command);
+                    ok = crestSubmitted && ok;
+                }
             }
         }
 
@@ -767,22 +789,8 @@ bool sds::HapticsManager::handle(GameEvent event) noexcept
             log(delivery);
         }
 
-        bool ok = true;
-        bool continuousSubmitted = false;
-        bool crestSubmitted = false;
-        if (_advancedHapticsEnabled.load(std::memory_order_acquire) && _backend && continuous) {
-            continuousSubmitted = _backend->setContinuous(*continuous);
-            if (!continuousSubmitted) {
-                log("Haptics: continuous state submission failed; HID features unaffected");
-                ok = false;
-            }
-        }
-        if (_advancedHapticsEnabled.load(std::memory_order_acquire) && _backend && command) {
-            crestSubmitted = _backend->enqueue(*command);
-            if (!crestSubmitted) {
-                log("Haptics: command submission failed; HID features unaffected");
-                ok = false;
-            }
+        if (!ok) {
+            log("Haptics: state or command submission failed; HID features unaffected");
         }
         if (event.type == GameEventType::ShipLaserWeaponFired &&
             command && continuous && continuousSubmitted && crestSubmitted) {
@@ -877,8 +885,8 @@ void sds::HapticsManager::handleLandVehicleMotionState(
     const LandVehicleMotionState& state) noexcept
 {
     try {
-        HapticContinuousState continuous{};
         bool submit = false;
+        bool submitted = true;
         {
             std::scoped_lock lock(_engineMutex);
             if (!_landVehicleProductionActive || !_landVehicleContextActive || _shipPilotActive ||
@@ -890,12 +898,10 @@ void sds::HapticsManager::handleLandVehicleMotionState(
                 _landVehicleForwardBoostDeadline = {};
                 _landVehicleVerticalThrustDeadline = {};
                 _landVehicleFeel.reset();
-                continuous = HapticContinuousState{};
                 submit = _landVehicleContextActive;
             } else if (_landVehicleProductionEpoch != 0 &&
                        state.authorityEpoch != _landVehicleProductionEpoch) {
                 clearLandVehicleProductionLocked();
-                continuous = HapticContinuousState{};
                 submit = true;
             } else {
                 if (_landVehicleProductionEpoch == 0) {
@@ -913,7 +919,6 @@ void sds::HapticsManager::handleLandVehicleMotionState(
                 } else {
                     _landVehicleContinuous = {};
                 }
-                continuous = composeLandVehicleContinuousLocked();
                 const auto diagnosticNow = std::chrono::steady_clock::now();
                 if (diagnosticNow >= _nextLandVehicleDiagnosticLog) {
                     _nextLandVehicleDiagnosticLog = diagnosticNow + std::chrono::seconds(1);
@@ -941,9 +946,10 @@ void sds::HapticsManager::handleLandVehicleMotionState(
                 }
                 submit = true;
             }
+            if (submit) submitted = submitContinuousLocked();
         }
 
-        if (submit && _advancedHapticsEnabled.load(std::memory_order_acquire) && _backend && !_backend->setContinuous(continuous)) {
+        if (!submitted) {
             log("Haptics: REV-8 continuous submission failed; HID features unaffected");
         }
     } catch (...) {
@@ -957,13 +963,12 @@ bool sds::HapticsManager::setLandVehicleBoostInput(
     std::chrono::steady_clock::time_point when) noexcept
 {
     try {
+        std::unique_lock lock(_engineMutex);
         HapticContinuousState continuous{};
         std::optional<HapticCommand> kick{};
         bool changed = false;
 
         {
-            std::scoped_lock lock(_engineMutex);
-
             bool& inputState =
                 vertical ?
                     _landVehicleVerticalThrustActive :
@@ -1025,7 +1030,7 @@ bool sds::HapticsManager::setLandVehicleBoostInput(
             }
 
             continuous =
-                composeLandVehicleContinuousLocked();
+                composeContinuousLocked();
         }
 
         if (!changed ||
@@ -1046,6 +1051,7 @@ bool sds::HapticsManager::setLandVehicleBoostInput(
                 submitted;
         }
 
+        lock.unlock();
         char diagnostic[256]{};
 
         std::snprintf(
@@ -1077,12 +1083,14 @@ bool sds::HapticsManager::handleShipPropulsionState(
     try {
         HapticContinuousState continuous{};
         bool submit = false;
+        bool submitted = true;
         {
             std::scoped_lock lock(_engineMutex);
             if (_shipPilotActive && _shipContextSuppressed && _shipBlockingMenuMask == 0) {
                 _shipPropulsionContinuous = mapShipPropulsionHaptics(state, 1.0F);
-                continuous = composeShipContinuousLocked();
+                continuous = composeContinuousLocked();
                 submit = true;
+                submitted = submitContinuousLocked();
             }
         }
 
@@ -1102,10 +1110,7 @@ bool sds::HapticsManager::handleShipPropulsionState(
             static_cast<double>(continuous.level));
         log(diagnostic);
 
-        if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
-            return true;
-        }
-        if (!_backend->setContinuous(continuous)) {
+        if (!submitted) {
             log("Haptics: ship propulsion continuous submission failed; HID features unaffected");
             return false;
         }
@@ -1123,22 +1128,19 @@ bool sds::HapticsManager::setShipLaunchLandingRumble(
     try {
         HapticContinuousState continuous{};
         bool changed = false;
+        bool submitted = true;
         {
             std::scoped_lock lock(_engineMutex);
             if (_shipLaunchLandingRumbleActive != active) {
                 _shipLaunchLandingRumbleActive = active;
-                continuous = composeShipContinuousLocked();
+                continuous = composeContinuousLocked();
+                submitted = submitContinuousLocked();
                 changed = true;
             }
         }
 
         if (!changed) {
             return true;
-        }
-
-        bool submitted = true;
-        if (_advancedHapticsEnabled.load(std::memory_order_acquire) && _backend) {
-            submitted = _backend->setContinuous(continuous);
         }
 
         char delivery[320]{};
@@ -1171,8 +1173,8 @@ bool sds::HapticsManager::handleRightTriggerInput(
     std::chrono::steady_clock::time_point when) noexcept
 {
     try {
-        HapticContinuousState state{};
         bool submitState = true;
+        bool submitted = true;
         {
             std::scoped_lock lock(_engineMutex);
             _lastR2 = r2;
@@ -1180,7 +1182,6 @@ bool sds::HapticsManager::handleRightTriggerInput(
             if (_shipContextSuppressed) {
                 if (_shipPilotActive && _shipLaserActive && r2 <= 12 && _shipBlockingMenuMask == 0) {
                     clearShipLaserLocked();
-                    state = composeShipContinuousLocked();
                     submitState = true;
                 } else {
                     submitState = false;
@@ -1202,24 +1203,19 @@ bool sds::HapticsManager::handleRightTriggerInput(
                             _cutterStartPending = false;
                             _cutterStartWhen = {};
                             _cutterStartDeadline = {};
-                            state = _engine.handleRightTriggerInput(0);
+                            (void)_engine.handleRightTriggerInput(0);
                         } else {
                             _cutterStartPending = false;
                             _cutterStartWhen = {};
                             _cutterStartDeadline = {};
-                            state = composeOnFootContinuousLocked();
                         }
-                    } else {
-                        state = composeOnFootContinuousLocked();
                     }
                 }
             }
+            if (submitState) submitted = submitContinuousLocked();
         }
 
-        if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend || !submitState) {
-            return true;
-        }
-        if (!_backend->setContinuous(state)) {
+        if (!submitted) {
             log("Haptics: continuous state submission failed; HID features unaffected");
             return false;
         }
@@ -1237,6 +1233,7 @@ bool sds::HapticsManager::emitWeaponReloadCue(
     bool useCustomReloadProfile) noexcept
 {
     try {
+        std::scoped_lock lock(_engineMutex);
         // The stage has already been authorized by the native weapon Wwise
         // post and successfully handed to the controller-speaker queue.
         const auto cue = weaponReloadHapticForAction(action);
@@ -1246,17 +1243,11 @@ bool sds::HapticsManager::emitWeaponReloadCue(
             _reloadBlockingMenus.load(std::memory_order_acquire) != 0u) {
             return true;
         }
-        float familyStrength = 0.0F;
-        {
-            std::scoped_lock lock(_engineMutex);
-            if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
-                return true;
-            }
-            // Same live TOML/SFSE weapon master, family toggle and family
-            // strength used by firing. One locked snapshot per event.
-            familyStrength = _engine.reloadHapticsFamilyScale(
-                borrowedReloadProfile, useCustomReloadProfile);
+        if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
+            return true;
         }
+        const float familyStrength = _engine.reloadHapticsFamilyScale(
+            borrowedReloadProfile, useCustomReloadProfile);
         if (familyStrength <= 0.0F) {
             return true;
         }
@@ -1288,6 +1279,7 @@ bool sds::HapticsManager::emitDigipickWwiseEvent(
     std::chrono::steady_clock::time_point when) noexcept
 {
     try {
+        std::unique_lock lock(_engineMutex);
         HapticEffectKind kind{};
         float baseGain = 0.0F;
         switch (eventId) {
@@ -1339,9 +1331,9 @@ bool sds::HapticsManager::emitBoostpackIgnition(
     std::chrono::steady_clock::time_point when) noexcept
 {
     try {
+        std::unique_lock lock(_engineMutex);
         std::optional<HapticCommand> command{};
         {
-            std::scoped_lock lock(_engineMutex);
             if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
                 return true;
             }
@@ -1383,14 +1375,12 @@ bool sds::HapticsManager::emitOnFootLanding(
     std::chrono::steady_clock::time_point when) noexcept
 {
     try {
+        std::scoped_lock lock(_engineMutex);
         if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
             return true;
         }
-        {
-            std::scoped_lock lock(_engineMutex);
-            if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
-                return true;
-            }
+        if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
+            return true;
         }
         const float gain = std::clamp(
             baseGain * _hapticStrength.load(std::memory_order_acquire),
@@ -1416,23 +1406,19 @@ bool sds::HapticsManager::emitOnFootLanding(
 bool sds::HapticsManager::startBoostpackThrust() noexcept
 {
     try {
-        HapticContinuousState state{};
+        std::unique_lock lock(_engineMutex);
         {
-            std::scoped_lock lock(_engineMutex);
             if (_shipContextSuppressed || _shipPilotActive || _landVehicleContextActive) {
                 _boostpackThrustActive = false;
                 return true;
             }
 
             _boostpackThrustActive = true;
-            state = composeOnFootContinuousLocked();
         }
 
-        if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
-            return true;
-        }
-
-        if (!_backend->setContinuous(state)) {
+        const bool submitted = submitContinuousLocked();
+        lock.unlock();
+        if (!submitted) {
             log("Haptics: boostpack thrust start failed; other controller features unaffected");
             return false;
         }
@@ -1451,27 +1437,11 @@ bool sds::HapticsManager::refreshBoostpackThrust() noexcept
 bool sds::HapticsManager::stopBoostpackThrust() noexcept
 {
     try {
-        HapticContinuousState state{};
-        {
-            std::scoped_lock lock(_engineMutex);
-            _boostpackThrustActive = false;
-
-            if (_shipPilotActive || _shipLaunchLandingRumbleActive) {
-                state = composeShipContinuousLocked();
-            } else if (_landVehicleProductionActive &&
-                       _landVehicleContextActive &&
-                       !_shipPilotActive) {
-                state = composeLandVehicleContinuousLocked();
-            } else {
-                state = composeOnFootContinuousLocked();
-            }
-        }
-
-        if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
-            return true;
-        }
-
-        if (!_backend->setContinuous(state)) {
+        std::unique_lock lock(_engineMutex);
+        _boostpackThrustActive = false;
+        const bool submitted = submitContinuousLocked();
+        lock.unlock();
+        if (!submitted) {
             log("Haptics: boostpack thrust stop failed; other controller features unaffected");
             return false;
         }
@@ -1484,13 +1454,11 @@ bool sds::HapticsManager::stopBoostpackThrust() noexcept
 bool sds::HapticsManager::tick(std::chrono::steady_clock::time_point now) noexcept
 {
     try {
+        std::unique_lock lock(_engineMutex);
         bool expired = false;
         bool shipLaserExpired = false;
         bool landVehicleBoostExpired = false;
-        HapticContinuousState state{};
         {
-            std::scoped_lock lock(_engineMutex);
-
             const bool forwardBoostExpired =
                 _landVehicleForwardBoostActive &&
                 _landVehicleForwardBoostDeadline !=
@@ -1514,9 +1482,6 @@ bool sds::HapticsManager::tick(std::chrono::steady_clock::time_point now) noexce
                     _landVehicleVerticalThrustDeadline = {};
                 }
 
-                state =
-                    composeLandVehicleContinuousLocked();
-
                 expired = true;
                 landVehicleBoostExpired = true;
             }
@@ -1526,7 +1491,6 @@ bool sds::HapticsManager::tick(std::chrono::steady_clock::time_point now) noexce
                     _shipLaserLeaseDeadline != std::chrono::steady_clock::time_point{} &&
                     now >= _shipLaserLeaseDeadline) {
                     clearShipLaserLocked();
-                    state = composeShipContinuousLocked();
                     expired = true;
                     shipLaserExpired = true;
                 }
@@ -1539,7 +1503,6 @@ bool sds::HapticsManager::tick(std::chrono::steady_clock::time_point now) noexce
                 _cutterStartWhen = {};
                 _cutterStartDeadline = {};
                 (void)_engine.handleRightTriggerInput(0);
-                state = composeOnFootContinuousLocked();
                 expired = true;
             }
         }
@@ -1547,16 +1510,15 @@ bool sds::HapticsManager::tick(std::chrono::steady_clock::time_point now) noexce
         if (!expired) {
             return true;
         }
+        const bool submitted = submitContinuousLocked();
+        lock.unlock();
         log(
             landVehicleBoostExpired ?
                 "Haptics: REV-8 boost/thrust lease expired; clearing stale continuous feedback" :
             shipLaserExpired ?
                 "Ship laser haptics: 250 ms heartbeat lease expired; stopping stale energy texture" :
                 "Haptics: Cutter beam heartbeat expired; stopping stale continuous feedback");
-        if (!_advancedHapticsEnabled.load(std::memory_order_acquire) || !_backend) {
-            return true;
-        }
-        if (!_backend->setContinuous(state)) {
+        if (!submitted) {
             log(
                 landVehicleBoostExpired ?
                     "Haptics: REV-8 boost/thrust lease clear failed; HID features unaffected" :
@@ -1574,6 +1536,7 @@ bool sds::HapticsManager::tick(std::chrono::steady_clock::time_point now) noexce
 
 bool sds::HapticsManager::active() const noexcept
 {
+    std::scoped_lock lock(_engineMutex);
     return _advancedHapticsEnabled.load(std::memory_order_acquire) &&
         _backend && _backend->active();
 }

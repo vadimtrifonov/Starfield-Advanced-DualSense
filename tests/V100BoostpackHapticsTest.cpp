@@ -199,6 +199,27 @@ int main()
             "boostpack body retains fixed low-frequency thrust texture level");
     }
 
+    sds::GameEvent equipped{};
+    equipped.type = sds::GameEventType::WeaponEquipped;
+    equipped.when = t0 + 10ms;
+    std::string_view("Maelstrom").copy(equipped.text.data(), 9);
+    check(manager.handle(equipped), "weapon equip during thrust is consumed");
+    const auto commandsBeforeShot = backend->commands.size();
+    sds::GameEvent shot{};
+    shot.type = sds::GameEventType::WeaponFired;
+    shot.when = t0 + 20ms;
+    check(manager.handle(shot) && backend->commands.size() == commandsBeforeShot + 1,
+        "weapon recoil still layers over active thrust");
+    check(backend->continuous.back().kind == sds::HapticContinuousKind::BoostpackThrust,
+        "weapon processing cannot displace the active thrust owner");
+    sds::GameEvent menu{};
+    menu.type = sds::GameEventType::MenuOpened;
+    menu.when = t0 + 30ms;
+    std::string_view("MonocleMenu").copy(menu.text.data(), 11);
+    check(manager.handle(menu) &&
+        backend->continuous.back().kind == sds::HapticContinuousKind::BoostpackThrust,
+        "unrelated menu processing preserves active thrust");
+
     const auto commandCountBeforeRefresh = backend->commands.size();
     const auto continuousCountBeforeRefresh = backend->continuous.size();
     check(manager.refreshBoostpackThrust(),

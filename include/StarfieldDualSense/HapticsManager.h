@@ -70,6 +70,8 @@ namespace sds
     private:
         void log(std::string_view message) const noexcept;
         void clearOnFootContextStateLocked() noexcept;
+        [[nodiscard]] HapticContinuousState composeContinuousLocked() noexcept;
+        [[nodiscard]] bool submitContinuousLocked() noexcept;
         [[nodiscard]] HapticContinuousState composeOnFootContinuousLocked() noexcept;
         [[nodiscard]] HapticContinuousState composeShipContinuousLocked() const noexcept;
         [[nodiscard]] HapticContinuousState composeLandVehicleContinuousLocked() const noexcept;
