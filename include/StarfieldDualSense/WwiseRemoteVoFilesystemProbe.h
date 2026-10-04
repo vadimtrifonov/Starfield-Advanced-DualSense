@@ -1,7 +1,5 @@
 #pragma once
 
-#include <StarfieldDualSense/WwiseWemSourceProbe.h>
-
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -27,9 +25,4 @@ namespace sds
     [[nodiscard]] std::string formatRemoteVoFilesystemProbeContext(
         std::wstring_view capturedPath,
         const std::filesystem::path& executablePath);
-
-    [[nodiscard]] std::string formatRemoteVoFilesystemCandidateProbe(
-        const RemoteVoFilesystemCandidate& candidate,
-        bool exists,
-        const WwiseWemSourceMetadata& metadata);
 }

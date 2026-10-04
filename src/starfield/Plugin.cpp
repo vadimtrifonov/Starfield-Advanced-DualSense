@@ -29,6 +29,7 @@
 #include <StarfieldDualSense/CustomWeaponReloadHapticStage.h>
 #include <StarfieldDualSense/WeaponSfxDiscoveryProbe.h>
 #include <StarfieldDualSense/RemoteVoSpeakerPlayback.h>
+#include <StarfieldDualSense/RemoteVoAudioPreparation.h>
 #include <StarfieldDualSense/RemoteVoOutputPolicy.h>
 #include <StarfieldDualSense/GameStateAdapter.h>
 #include <StarfieldDualSense/LandVehicleActionGate.h>
@@ -55,14 +56,6 @@
 #include <StarfieldDualSense/UiSpeakerPreparedCache.h>
 #include <StarfieldDualSense/UiSpeakerPlayback.h>
 #include <StarfieldDualSense/WwiseApiRecon.h>
-#include <StarfieldDualSense/WwiseWemSourceProbe.h>
-#include <StarfieldDualSense/WwiseRemoteVoFilesystemProbe.h>
-#include <StarfieldDualSense/WwiseVoiceArchiveManifestProbe.h>
-#include <StarfieldDualSense/WwiseVoiceBa2IndexProbe.h>
-#include <StarfieldDualSense/WwiseWemPayloadProbe.h>
-#include <StarfieldDualSense/WwiseWemStructureProbe.h>
-#include <StarfieldDualSense/WwiseWemVorbisPacketProbe.h>
-#include <StarfieldDualSense/WwiseWemVorbisDecode.h>
 #include <StarfieldDualSense/WwisePlayingIdStop.h>
 
 #include <RE/Starfield.h>
@@ -6151,292 +6144,202 @@ if (connected && g_controller->bluetoothTransport()) {
                             std::memory_order_release);
                     }
 
-                    const auto steadyMicrosNow = []() noexcept {
-                    return std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
-                };
-                const auto latencyMs = [&request, &steadyMicrosNow]() noexcept -> long long {
-                    if (request.captureSteadyMicros <= 0) {
-                        return -1;
+                    const auto latencyMs = [&request]() noexcept -> long long {
+                        if (request.captureSteadyMicros <= 0) {
+                            return -1;
+                        }
+                        const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        return (now - request.captureSteadyMicros) / 1000;
+                    };
+                    auto playback = sds::prepareRemoteVoAudio(
+                        request.filePath, request.codecId, resolvedSpeakerVoiceLanguage(),
+                        executablePath, nativeLog);
+                    const auto captureToDecodeMs = latencyMs();
+                    if (!playback.prepared) {
+                        return;
                     }
-                    return (steadyMicrosNow() - request.captureSteadyMicros) / 1000;
-                };
-                bool handled = false;
-                const auto candidates = sds::buildRemoteVoFilesystemCandidates(request.filePath, executablePath);
-                nativeLog(sds::formatRemoteVoFilesystemProbeContext(request.filePath, executablePath));
+                    nativeLog(sds::formatRemoteVoControllerPlaybackPreparation(playback));
 
-                const auto probeCandidate = [&nativeLog](const sds::RemoteVoFilesystemCandidate& candidate) {
-                    std::error_code existsError{};
-                    const bool exists = !candidate.path.empty() && std::filesystem::exists(candidate.path, existsError);
+                    bool submitted = false;
+                    bool dataslateQueued = false;
+                    std::size_t dataslatePendingCount = 0;
+                    const bool speakerManagerPresent = static_cast<bool>(g_speakerManager);
+                    const bool speakerActive = g_speakerManager && g_speakerManager->active();
+                    const auto submitNow = std::chrono::steady_clock::now();
 
-                    sds::WwiseWemSourceMetadata metadata{};
-                    if (candidate.path.empty()) {
-                        metadata.error = "path unavailable";
-                    } else {
-                        metadata = sds::probeWwiseWemFile(candidate.path, 64);
-                    }
-                    nativeLog(sds::formatRemoteVoFilesystemCandidateProbe(candidate, exists, metadata));
-                    return metadata.openSucceeded;
-                };
+                    if (g_speakerManager) {
+                        const sds::CapturedSoundIdentity identity{
+                            .id = (static_cast<std::uint64_t>(request.eventId) << 32u) |
+                                static_cast<std::uint64_t>(request.externalCookie),
+                            .controllerOnlySafe = false,
+                        };
 
-                const bool rawOpened = probeCandidate(candidates.raw);
-                const bool dataRootOpened = probeCandidate(candidates.dataRoot);
-                if (!rawOpened && !dataRootOpened) {
-                    const auto voiceLanguage =
-                        resolvedSpeakerVoiceLanguage();
+                        if (dataslateVoice &&
+                            g_dataslateControllerVoiceActive.load(std::memory_order_acquire)) {
 
-                    const auto manifest =
-                        sds::probeVoiceArchiveManifest(
-                            request.filePath,
-                            executablePath,
-                            voiceLanguage);
+                            try {
+                                std::scoped_lock lock(g_dataslateVoiceQueueMutex);
 
-                    nativeLog(
-                        sds::formatVoiceArchiveManifestContext(
-                            request.filePath,
-                            manifest));
-                    for (const auto& entry : manifest.entries) {
-                        nativeLog(sds::formatVoiceArchiveManifestEntry(entry));
-                        const auto indexProbe = sds::probeVoiceBa2Index(request.filePath, entry);
-                        nativeLog(sds::formatVoiceBa2IndexProbe(indexProbe));
-                        if (indexProbe.targetFound) {
-                            const auto payloadProbe = sds::probeVoiceWemPayload(indexProbe);
-                            nativeLog(sds::formatVoiceWemPayloadProbe(payloadProbe));
-                            if (payloadProbe.readSucceeded) {
-                                const auto structureProbe = sds::probeVoiceWemStructure(
-                                    payloadProbe,
-                                    request.codecId);
-                                nativeLog(sds::formatVoiceWemStructureProbeSummary(structureProbe));
-                                for (std::size_t chunkIndex = 0; chunkIndex < structureProbe.chunks.size(); ++chunkIndex) {
-                                    nativeLog(sds::formatVoiceWemStructureProbeChunk(
-                                        structureProbe.chunks[chunkIndex],
-                                        chunkIndex));
+                                const bool activeWindow =
+                                    g_dataslatePlaybackDeadline.time_since_epoch().count() != 0 &&
+                                    submitNow < g_dataslatePlaybackDeadline;
+
+                                if (activeWindow) {
+                                    DataslateQueuedVoiceChunk chunk{};
+                                    chunk.pcm = std::move(playback.pcm);
+                                    chunk.durationMs = playback.outputDurationMs;
+                                    chunk.sequence = request.sequence;
+
+                                    g_dataslateVoiceQueue.push_back(
+                                        std::move(chunk));
+
+                                    dataslatePendingCount =
+                                        g_dataslateVoiceQueue.size();
+
+                                    submitted = true;
+                                    dataslateQueued = true;
                                 }
-                                if (structureProbe.scanComplete) {
-                                    const auto vorbisProbe = sds::probeWwiseVorbisPackets(
-                                        payloadProbe,
-                                        structureProbe,
-                                        5u,
-                                        16u);
-                                    nativeLog(sds::formatWwiseVorbisPacketProbeSummary(vorbisProbe));
-                                    if (vorbisProbe.setupPacket.valid) {
-                                        nativeLog(sds::formatWwiseVorbisSetupPacketProbe(vorbisProbe));
-                                    }
-                                    for (std::size_t packetIndex = 0; packetIndex < vorbisProbe.audioPackets.size(); ++packetIndex) {
-                                        nativeLog(sds::formatWwiseVorbisAudioPacketProbe(
-                                            vorbisProbe.audioPackets[packetIndex],
-                                            packetIndex));
-                                    }
-                                    if (vorbisProbe.probeComplete) {
-                                        const auto decodeResult = sds::decodeWwiseVorbisToPcm(
-                                            payloadProbe,
-                                            structureProbe,
-                                            vorbisProbe);
-                                        nativeLog(sds::formatWwiseVorbisDecodeSummary(decodeResult));
-                                        const auto captureToDecodeMs = latencyMs();
-                                        if (decodeResult.decodeSucceeded) {
-                                            auto playback = sds::prepareRemoteVoControllerPlayback(decodeResult);
-                                            nativeLog(sds::formatRemoteVoControllerPlaybackPreparation(playback));
-
-                                            bool submitted = false;
-                                            bool dataslateQueued = false;
-                                            std::size_t dataslatePendingCount = 0;
-                                            const bool speakerManagerPresent = static_cast<bool>(g_speakerManager);
-                                            const bool speakerActive = g_speakerManager && g_speakerManager->active();
-                                            const auto submitNow = std::chrono::steady_clock::now();
-
-                                            if (playback.prepared && g_speakerManager) {
-                                                const sds::CapturedSoundIdentity identity{
-                                                    .id = (static_cast<std::uint64_t>(request.eventId) << 32u) |
-                                                        static_cast<std::uint64_t>(request.externalCookie),
-                                                    .controllerOnlySafe = false,
-                                                };
-
-                                                if (dataslateVoice &&
-                                                    g_dataslateControllerVoiceActive.load(std::memory_order_acquire)) {
-
-                                                    try {
-                                                        std::scoped_lock lock(g_dataslateVoiceQueueMutex);
-
-                                                        const bool activeWindow =
-                                                            g_dataslatePlaybackDeadline.time_since_epoch().count() != 0 &&
-                                                            submitNow < g_dataslatePlaybackDeadline;
-
-                                                        if (activeWindow) {
-                                                            DataslateQueuedVoiceChunk chunk{};
-                                                            chunk.pcm = std::move(playback.pcm);
-                                                            chunk.durationMs = playback.outputDurationMs;
-                                                            chunk.sequence = request.sequence;
-
-                                                            g_dataslateVoiceQueue.push_back(
-                                                                std::move(chunk));
-
-                                                            dataslatePendingCount =
-                                                                g_dataslateVoiceQueue.size();
-
-                                                            submitted = true;
-                                                            dataslateQueued = true;
-                                                        }
-                                                    } catch (...) {
-                                                        submitted = false;
-                                                        dataslateQueued = false;
-                                                    }
-                                                }
-
-                                                if (!dataslateQueued) {
-                                                    submitted = g_speakerManager->submitCaptured(
-                                                        std::move(playback.pcm),
-                                                        sds::SpeakerCategory::Comms,
-                                                        identity,
-                                                        true);
-                                                }
-                                            }
-
-                                            const bool replacedActive =
-                                                submitted &&
-                                                !dataslateVoice &&
-                                                g_remoteVoPlaybackDeadline.time_since_epoch().count() != 0 &&
-                                                submitNow < g_remoteVoPlaybackDeadline;
-                                            if (submitted) {
-                                                if (dataslateVoice) {
-                                                    g_dataslateControllerVoiceActive.store(
-                                                        true,
-                                                        std::memory_order_release);
-
-                                                    if (dataslateQueued) {
-                                                        char queueLog[256]{};
-                                                        std::snprintf(
-                                                            queueLog,
-                                                            sizeof(queueLog),
-                                                            "Dataslate controller voice: QUEUED seq=%llu durationMs=%llu pending=%zu reason=native-sequence-advanced-early",
-                                                            static_cast<unsigned long long>(request.sequence),
-                                                            static_cast<unsigned long long>(playback.outputDurationMs),
-                                                            dataslatePendingCount);
-                                                        nativeLog(queueLog);
-                                                    } else {
-                                                        {
-                                                            std::scoped_lock lock(
-                                                                g_dataslateVoiceQueueMutex);
-
-                                                            g_dataslatePlaybackDeadline =
-                                                                submitNow +
-                                                                std::chrono::milliseconds(
-                                                                    playback.outputDurationMs);
-
-                                                            g_dataslateContinuationDeadline =
-                                                                g_dataslatePlaybackDeadline +
-                                                                kDataslateContinuationGrace;
-                                                        }
-
-                                                        g_dataslatePauseRequested.store(
-                                                            false,
-                                                            std::memory_order_release);
-
-                                                        nativeLog(
-                                                            "Dataslate controller voice: ACTIVE exact-event=0xBDB11FAA");
-                                                    }
-                                                } else {
-                                                    g_remoteVoPlaybackDeadline = submitNow +
-                                                        std::chrono::milliseconds(
-                                                            playback.outputDurationMs);
-                                                }
-
-                                                handled = true;
-                                            }
-
-                                            const auto speakerOutputMode =
-                                                g_speakerManager ?
-                                                    g_speakerManager->outputMode() :
-                                                    sds::SpeakerOutputMode::Both;
-                                            const auto originalAction = sds::decideRemoteVoOriginalOutput(
-                                                speakerOutputMode,
-                                                submitted,
-                                                request.originalPlayingId);
-                                            bool originalStopIssued = false;
-                                            if (!dataslateVoice &&
-                                                originalAction == sds::RemoteVoOriginalOutputAction::StopOriginal) {
-                                                originalStopIssued =
-                                                    sds::stopWwisePlayingId(
-                                                        request.originalPlayingId);
-                                            }
-
-                                            const char* outputModeName = speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly
-                                                ? "ControllerOnly"
-                                                : "Both";
-                                            const char* originalOutput = "passthrough-both";
-
-                                            if (dataslateVoice) {
-
-                                                if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly &&
-
-                                                    g_audioCapture &&
-
-                                                    g_audioCapture->dataslateControllerOnlyRoutingActive()) {
-
-                                                    originalOutput =
-
-                                                        "silent-emitter-dataslate-native-lifecycle";
-
-                                                } else {
-
-                                                    originalOutput =
-
-                                                        "passthrough-dataslate-native-lifecycle";
-
-                                                }
-
-                                            } else if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly) {
-                                                if (!submitted) {
-                                                    originalOutput = "failsafe-passthrough-submit-rejected";
-                                                } else if (request.originalPlayingId == 0) {
-                                                    originalOutput = "failsafe-passthrough-no-playing-id";
-                                                } else {
-                                                    originalOutput = originalStopIssued
-                                                        ? "stopped"
-                                                        : "failsafe-passthrough-stop-unavailable";
-                                                }
-                                            }
-
-                                            char playbackLog[704]{};
-                                            std::snprintf(
-                                                playbackLog,
-                                                sizeof(playbackLog),
-                                                "Voice controller playback: seq=%llu submit=%s speakerManager=%s speakerActive=%s replacedActive=%s sourceFrames=%u sourceRate=%u outputFrames=%zu outputRate=%u durationMs=%llu captureToDecodeMs=%lld captureToSubmitMs=%lld category=Comms continuous=yes speakerOutputMode=%s originalPlayingId=%u originalOutput=%s",
-                                                static_cast<unsigned long long>(request.sequence),
-                                                submitted ? "accepted" : "rejected",
-                                                speakerManagerPresent ? "yes" : "no",
-                                                speakerActive ? "yes" : "no",
-                                                replacedActive ? "yes" : "no",
-                                                playback.sourceFrames,
-                                                playback.sourceSampleRate,
-                                                playback.outputFrames,
-                                                playback.outputSampleRate,
-                                                static_cast<unsigned long long>(playback.outputDurationMs),
-                                                captureToDecodeMs,
-                                                latencyMs(),
-                                                outputModeName,
-                                                request.originalPlayingId,
-                                                originalOutput);
-                                            nativeLog(playbackLog);
-                                        }
-                                    }
-                                }
+                            } catch (...) {
+                                submitted = false;
+                                dataslateQueued = false;
                             }
                         }
-                        if (handled) {
-                            char handledLog[256]{};
-                            std::snprintf(
-                                handledLog,
-                                sizeof(handledLog),
-                                "Voice archive probe: seq=%llu handled=yes archive=\"%s\"; remaining archives skipped",
-                                static_cast<unsigned long long>(request.sequence),
-                                entry.archiveName.c_str());
-                            nativeLog(handledLog);
-                            break;
+
+                        if (!dataslateQueued) {
+                            submitted = g_speakerManager->submitCaptured(
+                                std::move(playback.pcm),
+                                sds::SpeakerCategory::Comms,
+                                identity,
+                                true);
                         }
                     }
-                }
-            };
+
+                    const bool replacedActive =
+                        submitted &&
+                        !dataslateVoice &&
+                        g_remoteVoPlaybackDeadline.time_since_epoch().count() != 0 &&
+                        submitNow < g_remoteVoPlaybackDeadline;
+                    if (submitted) {
+                        if (dataslateVoice) {
+                            g_dataslateControllerVoiceActive.store(
+                                true,
+                                std::memory_order_release);
+
+                            if (dataslateQueued) {
+                                char queueLog[256]{};
+                                std::snprintf(
+                                    queueLog,
+                                    sizeof(queueLog),
+                                    "Dataslate controller voice: QUEUED seq=%llu durationMs=%llu pending=%zu reason=native-sequence-advanced-early",
+                                    static_cast<unsigned long long>(request.sequence),
+                                    static_cast<unsigned long long>(playback.outputDurationMs),
+                                    dataslatePendingCount);
+                                nativeLog(queueLog);
+                            } else {
+                                {
+                                    std::scoped_lock lock(
+                                        g_dataslateVoiceQueueMutex);
+
+                                    g_dataslatePlaybackDeadline =
+                                        submitNow +
+                                        std::chrono::milliseconds(
+                                            playback.outputDurationMs);
+
+                                    g_dataslateContinuationDeadline =
+                                        g_dataslatePlaybackDeadline +
+                                        kDataslateContinuationGrace;
+                                }
+
+                                g_dataslatePauseRequested.store(
+                                    false,
+                                    std::memory_order_release);
+
+                                nativeLog(
+                                    "Dataslate controller voice: ACTIVE exact-event=0xBDB11FAA");
+                            }
+                        } else {
+                            g_remoteVoPlaybackDeadline = submitNow +
+                                std::chrono::milliseconds(
+                                    playback.outputDurationMs);
+                        }
+                    }
+
+                    const auto speakerOutputMode =
+                        g_speakerManager ?
+                            g_speakerManager->outputMode() :
+                            sds::SpeakerOutputMode::Both;
+                    const auto originalAction = sds::decideRemoteVoOriginalOutput(
+                        speakerOutputMode,
+                        submitted,
+                        request.originalPlayingId);
+                    bool originalStopIssued = false;
+                    if (!dataslateVoice &&
+                        originalAction == sds::RemoteVoOriginalOutputAction::StopOriginal) {
+                        originalStopIssued =
+                            sds::stopWwisePlayingId(
+                                request.originalPlayingId);
+                    }
+
+                    const char* outputModeName = speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly
+                        ? "ControllerOnly"
+                        : "Both";
+                    const char* originalOutput = "passthrough-both";
+
+                    if (dataslateVoice) {
+
+                        if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly &&
+
+                            g_audioCapture &&
+
+                            g_audioCapture->dataslateControllerOnlyRoutingActive()) {
+
+                            originalOutput =
+
+                                "silent-emitter-dataslate-native-lifecycle";
+
+                        } else {
+
+                            originalOutput =
+
+                                "passthrough-dataslate-native-lifecycle";
+
+                        }
+
+                    } else if (speakerOutputMode == sds::SpeakerOutputMode::ControllerOnly) {
+                        if (!submitted) {
+                            originalOutput = "failsafe-passthrough-submit-rejected";
+                        } else if (request.originalPlayingId == 0) {
+                            originalOutput = "failsafe-passthrough-no-playing-id";
+                        } else {
+                            originalOutput = originalStopIssued
+                                ? "stopped"
+                                : "failsafe-passthrough-stop-unavailable";
+                        }
+                    }
+
+                    char playbackLog[704]{};
+                    std::snprintf(
+                        playbackLog,
+                        sizeof(playbackLog),
+                        "Voice controller playback: seq=%llu submit=%s speakerManager=%s speakerActive=%s replacedActive=%s sourceFrames=%u sourceRate=%u outputFrames=%zu outputRate=%u durationMs=%llu captureToDecodeMs=%lld captureToSubmitMs=%lld category=Comms continuous=yes speakerOutputMode=%s originalPlayingId=%u originalOutput=%s",
+                        static_cast<unsigned long long>(request.sequence),
+                        submitted ? "accepted" : "rejected",
+                        speakerManagerPresent ? "yes" : "no",
+                        speakerActive ? "yes" : "no",
+                        replacedActive ? "yes" : "no",
+                        playback.sourceFrames,
+                        playback.sourceSampleRate,
+                        playback.outputFrames,
+                        playback.outputSampleRate,
+                        static_cast<unsigned long long>(playback.outputDurationMs),
+                        captureToDecodeMs,
+                        latencyMs(),
+                        outputModeName,
+                        request.originalPlayingId,
+                        originalOutput);
+                    nativeLog(playbackLog);
+                };
             }
 
             sds::StarfieldAudioCapture::WeaponSfxObservationCallback weaponSfxObservation{};

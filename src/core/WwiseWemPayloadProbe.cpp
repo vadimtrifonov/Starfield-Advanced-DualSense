@@ -45,6 +45,35 @@ namespace
         return payload.size() >= offset + expected.size() &&
             std::equal(expected.begin(), expected.end(), payload.begin() + static_cast<std::ptrdiff_t>(offset));
     }
+
+    void readPayload(std::ifstream& stream, sds::VoiceWemPayloadProbeResult& result)
+    {
+        if (!seekAbsolute(stream, result.dataOffset)) {
+            result.error = "WEM payload seek failed";
+            return;
+        }
+
+        result.payload.resize(result.expectedSize);
+        stream.read(
+            reinterpret_cast<char*>(result.payload.data()),
+            static_cast<std::streamsize>(result.payload.size()));
+        result.bytesRead = static_cast<std::uint64_t>(stream.gcount());
+        if (result.bytesRead != result.expectedSize) {
+            result.payload.clear();
+            result.error = "WEM payload read truncated";
+            return;
+        }
+        result.readSucceeded = true;
+
+        constexpr std::array<unsigned char, 4> riff{ 'R', 'I', 'F', 'F' };
+        constexpr std::array<unsigned char, 4> wave{ 'W', 'A', 'V', 'E' };
+        result.riffWave = hasFourCc(result.payload, 0, riff) && hasFourCc(result.payload, 8, wave);
+        if (result.riffWave && result.payload.size() >= 12) {
+            result.riffDeclaredSize = readU32Le(result.payload.data() + 4);
+            result.riffTotalBytes = static_cast<std::uint64_t>(result.riffDeclaredSize) + 8ULL;
+            result.riffSizeMatchesPayload = result.riffTotalBytes == result.payload.size();
+        }
+    }
 }
 
 sds::VoiceWemPayloadProbeResult sds::probeVoiceWemPayload(const VoiceBa2IndexProbeResult& indexResult)
@@ -102,32 +131,32 @@ sds::VoiceWemPayloadProbeResult sds::probeVoiceWemPayload(const VoiceBa2IndexPro
         return result;
     }
 
-    if (!seekAbsolute(stream, result.dataOffset)) {
-        result.error = "WEM payload seek failed";
+    readPayload(stream, result);
+    return result;
+}
+
+sds::VoiceWemPayloadProbeResult sds::probeVoiceWemPayload(const std::filesystem::path& path)
+{
+    VoiceWemPayloadProbeResult result{};
+    result.capturedPath = path.wstring();
+    result.attempted = true;
+
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        result.error = "loose file open failed";
         return result;
     }
+    result.openSucceeded = true;
 
-    result.payload.resize(result.expectedSize);
-    stream.read(
-        reinterpret_cast<char*>(result.payload.data()),
-        static_cast<std::streamsize>(result.payload.size()));
-    result.bytesRead = static_cast<std::uint64_t>(stream.gcount());
-    if (result.bytesRead != result.expectedSize) {
-        result.payload.clear();
-        result.error = "WEM payload read truncated";
+    std::error_code sizeError{};
+    const auto fileSize = std::filesystem::file_size(path, sizeError);
+    if (sizeError || fileSize == 0 || fileSize > std::numeric_limits<std::uint32_t>::max()) {
+        result.error = "WEM payload size unavailable";
         return result;
     }
-    result.readSucceeded = true;
+    result.expectedSize = static_cast<std::uint32_t>(fileSize);
 
-    constexpr std::array<unsigned char, 4> riff{ 'R', 'I', 'F', 'F' };
-    constexpr std::array<unsigned char, 4> wave{ 'W', 'A', 'V', 'E' };
-    result.riffWave = hasFourCc(result.payload, 0, riff) && hasFourCc(result.payload, 8, wave);
-    if (result.riffWave && result.payload.size() >= 12) {
-        result.riffDeclaredSize = readU32Le(result.payload.data() + 4);
-        result.riffTotalBytes = static_cast<std::uint64_t>(result.riffDeclaredSize) + 8ULL;
-        result.riffSizeMatchesPayload = result.riffTotalBytes == result.payload.size();
-    }
-
+    readPayload(stream, result);
     return result;
 }
 
@@ -136,9 +165,11 @@ std::string sds::formatVoiceWemPayloadProbe(
     std::size_t prefixBytes)
 {
     std::ostringstream out;
-    out << "Voice WEM payload probe: target=\"" << narrow(result.capturedPath) << "\""
-        << " archive=\"" << result.archiveName << "\""
-        << " offset=" << result.dataOffset
+    out << "Voice WEM payload probe: target=\"" << narrow(result.capturedPath) << "\"";
+    if (!result.archiveName.empty()) {
+        out << " archive=\"" << result.archiveName << "\"";
+    }
+    out << " offset=" << result.dataOffset
         << " size=" << result.expectedSize
         << " read=" << (result.readSucceeded ? "success" : "failed")
         << " bytesRead=" << result.bytesRead;

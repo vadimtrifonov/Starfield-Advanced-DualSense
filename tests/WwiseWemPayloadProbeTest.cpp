@@ -1,3 +1,4 @@
+#undef NDEBUG
 #include <StarfieldDualSense/WwiseWemPayloadProbe.h>
 
 #include <array>
@@ -86,6 +87,33 @@ int main()
     assert(line.find("container=RIFF/WAVE") != std::string::npos);
     assert(line.find("riffSizeMatches=yes") != std::string::npos);
     assert(line.find("prefix=52 49 46 46") != std::string::npos);
+
+    const auto loosePath = tempRoot / "voice.wem";
+    {
+        std::ofstream out(loosePath, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    }
+    const auto loose = sds::probeVoiceWemPayload(loosePath);
+    assert(loose.openSucceeded && loose.readSucceeded);
+    assert(loose.dataOffset == 0);
+    assert(loose.payload == result.payload);
+    assert(loose.riffWave && loose.riffSizeMatchesPayload);
+    assert(loose.error.empty());
+
+    std::filesystem::resize_file(loosePath, payload.size() - 1);
+    const auto truncatedLoose = sds::probeVoiceWemPayload(loosePath);
+    assert(truncatedLoose.openSucceeded && truncatedLoose.readSucceeded);
+    assert(truncatedLoose.riffWave && !truncatedLoose.riffSizeMatchesPayload);
+
+    std::filesystem::resize_file(loosePath, 0);
+    const auto emptyLoose = sds::probeVoiceWemPayload(loosePath);
+    assert(emptyLoose.openSucceeded && !emptyLoose.readSucceeded);
+    assert(!emptyLoose.error.empty());
+
+    std::filesystem::remove(loosePath);
+    const auto missingLoose = sds::probeVoiceWemPayload(loosePath);
+    assert(!missingLoose.openSucceeded && !missingLoose.readSucceeded);
+    assert(!missingLoose.error.empty());
 
     auto wrongExtensionIndex = index;
     wrongExtensionIndex.extension = "txt";

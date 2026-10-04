@@ -32,6 +32,9 @@ namespace sds
     [[nodiscard]] VoiceWemPayloadProbeResult probeVoiceWemPayload(
         const VoiceBa2IndexProbeResult& indexResult);
 
+    [[nodiscard]] VoiceWemPayloadProbeResult probeVoiceWemPayload(
+        const std::filesystem::path& path);
+
     [[nodiscard]] std::string formatVoiceWemPayloadProbe(
         const VoiceWemPayloadProbeResult& result,
         std::size_t prefixBytes = 32);

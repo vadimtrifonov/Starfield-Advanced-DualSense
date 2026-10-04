@@ -25,13 +25,5 @@ int main()
     assert(text.find("Data/Sound/Voice/Starfield.esm/GenericFemaleEvenToned/00588978.wem") != std::string::npos);
 #endif
 
-    const auto formatted = sds::formatRemoteVoFilesystemCandidateProbe(
-        candidates.dataRoot,
-        false,
-        sds::WwiseWemSourceMetadata{});
-    assert(formatted.find("candidate=data-root") != std::string::npos);
-    assert(formatted.find("exists=no") != std::string::npos);
-    assert(formatted.find("open=failed") != std::string::npos);
-
     return 0;
 }

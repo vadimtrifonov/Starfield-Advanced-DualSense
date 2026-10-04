@@ -78,6 +78,7 @@ local core_sources = {
     "src/core/WeaponAudioPipeline.cpp",
     "src/core/WeaponAudioPipelineBackend.cpp",
     "src/core/RemoteVoSpeakerPlayback.cpp",
+    "src/core/RemoteVoAudioPreparation.cpp",
     "src/core/WwiseReconSelection.cpp",
     "src/core/WwiseCallgraphAnalysis.cpp",
     "src/core/WwiseCanarySafety.cpp",
@@ -85,7 +86,6 @@ local core_sources = {
     "src/core/WwiseRemoteVoDelay.cpp",
     "src/core/WwiseWindowsDeviceId.cpp",
     "src/core/WwiseSpatialProbeGate.cpp",
-    "src/core/WwiseWemSourceProbe.cpp",
     "src/core/WwiseRemoteVoFilesystemProbe.cpp",
     "src/core/WwiseVoiceArchiveManifestProbe.cpp",
     "src/core/WwiseVoiceBa2IndexProbe.cpp",
@@ -969,21 +969,13 @@ target("sds-wwise-spatial-probe-tests", function()
     add_files("tests/WwiseSpatialProbeGateTest.cpp", "src/core/WwiseSpatialProbeGate.cpp")
 end)
 
-target("sds-wwise-wem-source-probe-tests", function()
-    set_kind("binary")
-    set_default(false)
-    add_includedirs("include")
-    add_files("tests/WwiseWemSourceProbeTest.cpp", "src/core/WwiseWemSourceProbe.cpp")
-end)
-
 target("sds-wwise-remote-vo-filesystem-probe-tests", function()
     set_kind("binary")
     set_default(false)
     add_includedirs("include")
     add_files(
         "tests/WwiseRemoteVoFilesystemProbeTest.cpp",
-        "src/core/WwiseRemoteVoFilesystemProbe.cpp",
-        "src/core/WwiseWemSourceProbe.cpp")
+        "src/core/WwiseRemoteVoFilesystemProbe.cpp")
 end)
 
 target("sds-wwise-voice-archive-manifest-probe-tests", function()
@@ -1039,6 +1031,24 @@ target("sds-wwise-vorbis-packet-probe-tests", function()
     add_includedirs("include")
     add_files(
         "tests/WwiseWemVorbisPacketProbeTest.cpp",
+        "src/core/WwiseWemStructureProbe.cpp",
+        "src/core/WwiseWemVorbisPacketProbe.cpp")
+end)
+
+target("sds-remote-vo-audio-preparation-tests", function()
+    set_kind("binary")
+    set_default(false)
+    add_includedirs("include")
+    add_files(
+        "tests/RemoteVoAudioPreparationTest.cpp",
+        "src/core/RemoteVoAudioPreparation.cpp",
+        "src/core/RemoteVoSpeakerPlayback.cpp",
+        "src/core/SpeakerPcm.cpp",
+        "src/core/CommsProcessor.cpp",
+        "src/core/WwiseRemoteVoFilesystemProbe.cpp",
+        "src/core/WwiseVoiceArchiveManifestProbe.cpp",
+        "src/core/WwiseVoiceBa2IndexProbe.cpp",
+        "src/core/WwiseWemPayloadProbe.cpp",
         "src/core/WwiseWemStructureProbe.cpp",
         "src/core/WwiseWemVorbisPacketProbe.cpp")
 end)
