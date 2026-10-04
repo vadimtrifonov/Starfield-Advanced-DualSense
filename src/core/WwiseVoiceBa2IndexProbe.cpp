@@ -8,7 +8,6 @@
 #include <limits>
 #include <sstream>
 #include <string>
-#include <vector>
 
 namespace
 {
@@ -49,15 +48,13 @@ namespace
         return out;
     }
 
-    [[nodiscard]] std::string normalizeArchivePath(std::string value)
+    [[nodiscard]] bool archivePathsEqual(std::string_view left, std::string_view right)
     {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-            if (ch == '/') {
-                return '\\';
-            }
-            return static_cast<char>(std::tolower(ch));
-        });
-        return value;
+        return std::equal(left.begin(), left.end(), right.begin(), right.end(),
+            [](unsigned char a, unsigned char b) {
+                return (a == '/' ? '\\' : std::tolower(a)) ==
+                    (b == '/' ? '\\' : std::tolower(b));
+            });
     }
 
     [[nodiscard]] bool seekAbsolute(std::ifstream& stream, std::uint64_t offset)
@@ -165,22 +162,13 @@ sds::VoiceBa2IndexProbeResult sds::probeVoiceBa2Index(
         return result;
     }
 
-    // Walk the complete fixed-size record table once so truncated/corrupt index
-    // metadata fails before the name table is trusted. Payload bytes are never read.
-    std::array<unsigned char, kGnrlRecordSize> record{};
-    for (std::uint32_t index = 0; index < result.fileCount; ++index) {
-        if (!readExact(stream, record.data(), record.size())) {
-            result.error = "GNRL record table truncated";
-            return result;
-        }
-    }
-
     if (!seekAbsolute(stream, result.nameTableOffset)) {
         result.error = "name table seek failed";
         return result;
     }
 
-    const auto target = normalizeArchivePath(narrow(capturedPath));
+    const auto target = narrow(capturedPath);
+    std::string name;
     for (std::uint32_t index = 0; index < result.fileCount; ++index) {
         std::array<unsigned char, 2> lengthBytes{};
         if (!readExact(stream, lengthBytes.data(), lengthBytes.size())) {
@@ -189,14 +177,13 @@ sds::VoiceBa2IndexProbeResult sds::probeVoiceBa2Index(
         }
 
         const auto nameLength = readU16Le(lengthBytes.data());
-        std::vector<char> nameBytes(nameLength);
-        if (nameLength != 0 && !readExact(stream, nameBytes.data(), nameBytes.size())) {
+        name.resize(nameLength);
+        if (nameLength != 0 && !readExact(stream, name.data(), name.size())) {
             result.error = "name table entry truncated";
             return result;
         }
 
-        std::string name(nameBytes.begin(), nameBytes.end());
-        if (normalizeArchivePath(name) != target) {
+        if (!archivePathsEqual(name, target)) {
             continue;
         }
 
@@ -204,6 +191,7 @@ sds::VoiceBa2IndexProbeResult sds::probeVoiceBa2Index(
         result.recordIndex = index;
         result.matchedName = std::move(name);
 
+        std::array<unsigned char, kGnrlRecordSize> record{};
         const auto recordOffset = kStarfieldV2HeaderSize + (static_cast<std::uint64_t>(index) * kGnrlRecordSize);
         if (!seekAbsolute(stream, recordOffset) || !readExact(stream, record.data(), record.size())) {
             result.error = "matched GNRL record read failed";

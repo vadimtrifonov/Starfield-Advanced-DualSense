@@ -1,3 +1,4 @@
+#undef NDEBUG
 #include <StarfieldDualSense/WwiseVoiceBa2IndexProbe.h>
 
 #include <array>
@@ -137,6 +138,16 @@ int main()
     assert(result.padding == 0xBAADF00DU);
     assert(result.paddingValid);
 
+    const auto first = sds::probeVoiceBa2Index(
+        L"Sound\\Voice\\Starfield.esm\\GenericFemaleEvenToned\\not-this-one.wem", archive);
+    assert(first.targetFound && first.recordIndex == 0);
+    assert(first.nameHash == 0x11111111U);
+
+    const auto last = sds::probeVoiceBa2Index(
+        L"SOUND/VOICE/STARFIELD.ESM/GENERICFEMALEEVENTONED/ALSO-NOT-THIS.WEM", archive);
+    assert(last.targetFound && last.recordIndex == 2);
+    assert(last.nameHash == 0x33333333U);
+
     const auto line = sds::formatVoiceBa2IndexProbe(result);
     assert(line.find("Voice BA2 index probe:") != std::string::npos);
     assert(line.find("archive=\"Starfield - Voices01.ba2\"") != std::string::npos);
@@ -159,6 +170,11 @@ int main()
     assert(miss.error.empty());
     const auto missLine = sds::formatVoiceBa2IndexProbe(miss);
     assert(missLine.find("match=no") != std::string::npos);
+
+    std::filesystem::resize_file(archivePath, result.nameTableOffset - 1);
+    const auto truncated = sds::probeVoiceBa2Index(captured, archive);
+    assert(!truncated.targetFound);
+    assert(truncated.error == "BA2 index extends beyond archive");
 
     std::filesystem::remove_all(tempRoot, cleanupError);
     return 0;
