@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*-v.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Validate release tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+-v\.\d+$') {
+            throw "Release tag must have the form v1.2.3-v.4: $env:GITHUB_REF_NAME"
+          }
+
+      - name: Set up xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: "3.1.2"
+
+      - name: Fetch dependencies
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          # The revision this fork is built and tested against.
+          git clone --recurse-submodules https://github.com/libxse/commonlibsf.git external/CommonLibSF
+          git -C external/CommonLibSF checkout --recurse-submodules e0dbccd3a3716363f6b99194c98b7d2cccf2e7e6
+          ./scripts/bootstrap-vorbis-deps.ps1
+
+      - name: Build release archive
+        shell: pwsh
+        run: ./scripts/package.ps1 -SkipSource
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = $env:GITHUB_REF_NAME
+          $version = $tag.Substring(1, $tag.IndexOf('-') - 1)
+          $archive = "dist/StarfieldDualSense_v${version}_Nexus.zip"
+          if (-not (Test-Path -LiteralPath $archive)) {
+            throw "Tag $tag does not match the packaged project version; expected $archive."
+          }
+          $asset = "dist/StarfieldDualSense_$tag.zip"
+          Move-Item -LiteralPath $archive -Destination $asset
+          gh release create $tag $asset --verify-tag --title $tag --generate-notes
